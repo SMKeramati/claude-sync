@@ -2,20 +2,27 @@
 # claude-sync: make local Claude Code sessions visible across all your
 # Claude Desktop accounts on this Mac.
 #
-# Claude Desktop keeps a separate Claude Code session index per account
-# (one UUID folder per account under ~/Library/Application Support/Claude/
-# claude-code-sessions). Switch accounts and your session list looks empty,
-# even though every transcript is still on disk in ~/.claude/projects.
-# This script reconciles the index files across accounts:
-#   - the copy with the newest lastActivityAt wins,
-#   - archived-in-one means archived-everywhere,
-#   - every overwrite is backed up first and can be undone with --revert,
-#   - deletions propagate by default: a session fully synced once,
-#     then deleted in ANY account and untouched since, is deleted everywhere
-#     (backed up first, revertible). --no-deletes turns that off for a run;
-#     because a skipped deletion is re-copied from the surviving accounts,
-#     --no-deletes doubles as the restore path for an accidental delete.
-#     See the ledger machinery below.
+# Claude Desktop keeps a separate Claude Code session list per account+org
+# (one <accountUuid>/<orgUuid> folder of local_*.json entries under
+# ~/Library/Application Support/Claude/claude-code-sessions). Switch
+# accounts and your session list looks empty, even though every transcript
+# is still on disk in ~/.claude/projects.
+#
+# v4 fixes that structurally instead of copying files around:
+#   - UNIFY: one physical list at claude-code-sessions/_shared; every
+#     <account>/<org> folder becomes a symlink to it. Each list entry
+#     exists once, every account sees it, and a new session written by the
+#     app lands in _shared and appears everywhere instantly. The one-time
+#     restructure (and absorbing any fresh real folder the app creates
+#     later) runs only while Claude Desktop is fully closed, after a
+#     whole-tree backup; --revert restores the tree verbatim.
+#   - SELF-HEAL: the app sometimes never writes a list entry for a session
+#     (seen after restarts and rewound sessions), so it vanishes from the
+#     list although its transcript is intact. Every run scans
+#     ~/.claude/projects/*/*.jsonl and recreates a missing entry from the
+#     transcript itself (title from the first user message; cwd and
+#     timestamps from the transcript). Existing entries are never edited
+#     or deleted; transcripts are only ever read.
 #
 # It also syncs customization across PROFILES: multi-profile launchers
 # (claude-deck) give each profile its own data dir under
@@ -42,16 +49,20 @@
 #
 # https://github.com/SMKeramati/claude-sync
 
-VERSION="3.0.0"
+VERSION="4.0.0"
 
 # Absolute path: /usr/local/bin may shadow osascript with a wrapper (seen in
 # the wild: a VPN toggle shim), and LaunchAgent PATH is minimal anyway.
 OSASCRIPT="/usr/bin/osascript"
 
-# CLAUDE_SYNC_SESSIONS_DIR / CLAUDE_SYNC_HOME (and the two profile-root
-# overrides) exist so tests can point the script at a throwaway tree
-# instead of the real one.
+# CLAUDE_SYNC_SESSIONS_DIR / CLAUDE_SYNC_PROJECTS_DIR / CLAUDE_SYNC_HOME
+# (and the two profile-root overrides) exist so tests can point the script
+# at a throwaway tree instead of the real one.
 SESSIONS_DIR="${CLAUDE_SYNC_SESSIONS_DIR:-$HOME/Library/Application Support/Claude/claude-code-sessions}"
+SHARED_DIR="$SESSIONS_DIR/_shared"
+# Transcripts: read-only source of truth for the self-heal step. Nothing
+# under ~/.claude is ever written by the session machinery.
+PROJECTS_DIR="${CLAUDE_SYNC_PROJECTS_DIR:-$HOME/.claude/projects}"
 DEFAULT_ROOT="${CLAUDE_SYNC_DEFAULT_ROOT:-$HOME/Library/Application Support/Claude}"
 PROFILES_DIR="${CLAUDE_SYNC_PROFILES_DIR:-$HOME/Library/Application Support/Claude Profiles}"
 CANONICAL_DIR="${CLAUDE_SYNC_HOME:-$HOME/.claude/scripts}"
@@ -59,18 +70,13 @@ CANONICAL_PATH="$CANONICAL_DIR/claude-sync.sh"
 LOG="$CANONICAL_DIR/claude-sync.log"
 BACKUPS_DIR="$CANONICAL_DIR/backups"
 BACKUP_KEEP=10
-LEDGER="$CANONICAL_DIR/ledger.tsv"
-# Companion file, not part of the ledger.tsv row format: the account names
-# that were part of the "present in every account" computation the last
-# time the ledger was written. Needed so a brand-new account joining after
-# the ledger was last written is never mistaken for "had this session and
-# it got deleted" -- see compute_deletions.
-LEDGER_ACCOUNTS="$CANONICAL_DIR/.ledger-accounts.tsv"
-# Same idea for the profile layer: the MCP server names that were present
-# in EVERY profile's config at the end of the last sync. A name in this
-# ledger but missing from some profile now = the user removed it there, so
-# it is removed everywhere. A name absent from the ledger = new, so it is
-# added everywhere. Without this file no MCP removal can ever propagate.
+# Profile layer ledger: the MCP server names that were present in EVERY
+# profile's config at the end of the last sync. A name in this ledger but
+# missing from some profile now = the user removed it there, so it is
+# removed everywhere. A name absent from the ledger = new, so it is added
+# everywhere. Without this file no MCP removal can ever propagate.
+# (The v2/v3 session ledgers ledger.tsv/.ledger-accounts.tsv are obsolete:
+# one physical list needs no reconciliation. Stale copies are harmless.)
 MCP_LEDGER="$CANONICAL_DIR/mcp-ledger.tsv"
 
 RC_FILE="$HOME/.zshrc"
@@ -100,9 +106,9 @@ die() { echo "${YELLOW}$*${RESET}" >&2; exit 1; }
 # Globs only, no find: on macOS, find (getattrlistbulk) can return empty
 # results inside freshly created session dirs while plain readdir works.
 collect_accounts() {
-  # One UUID folder per account. Skip non-account dirs like "_shared"
-  # (left behind by other sync experiments/tools); they are not accounts
-  # and must never be written into.
+  # One UUID folder per account. Underscore-prefixed dirs are not accounts:
+  # "_shared" is ours (the unified list itself), anything else _-prefixed
+  # was left by other tools.
   accounts=()
   for d in "$SESSIONS_DIR"/*/; do
     [ -d "$d" ] || continue
@@ -111,17 +117,10 @@ collect_accounts() {
   done
 }
 
-count_index_files() {
-  # $1: dir holding local_*.json directly, or account dir with org subdirs
+count_shared_entries() {
   n=0
-  for f in "$1"/local_*.json; do
+  for f in "$SHARED_DIR"/local_*.json; do
     [ -f "$f" ] && n=$((n + 1))
-  done
-  for org in "$1"/*/; do
-    [ -d "$org" ] || continue
-    for f in "$org"local_*.json; do
-      [ -f "$f" ] && n=$((n + 1))
-    done
   done
   echo "$n"
 }
@@ -376,424 +375,319 @@ sync_profiles() {
   sync_extensions "$mode"
 }
 
-# ---------- sync core ------------------------------------------------------
-# Two passes over the whole tree, O(total files): every index file is read
-# exactly once and all copies are planned from that inventory (never
-# src-account x dst-account loops; that was ~70k existence checks here).
+# ---------- session list: one shared list + self-heal ---------------------
+# v4 replaced the copy-everywhere session sync with a symlink design:
+#   claude-code-sessions/_shared/          one physical set of local_*.json
+#   <account>/<org>  ->  ../_shared        every subfolder is a symlink
+# Every account/org sees the same list, a new session written by the app
+# lands in _shared and appears everywhere instantly, and there is nothing
+# left to reconcile (the v2/v3 winner/ledger/deletion machinery is gone).
+# The self-heal step then recreates list entries the app lost: any
+# transcript in ~/.claude/projects with no matching entry in _shared gets
+# one generated from the transcript itself. Entries are never edited or
+# deleted; transcripts are only ever read.
 #
-# All intermediate state lives in $WORK_DIR (a mktemp dir, removed on exit):
-#   orgdirs.tsv   account<TAB>org<TAB>orgPath      (every destination dir)
-#   inv.tsv       fname<TAB>ts<TAB>arch<TAB>account<TAB>org<TAB>path
-#   winners.tsv   fname<TAB>winnerTs<TAB>archOR<TAB>winnerArch<TAB>winnerPath
-#   staged/       archive-flipped copies of winners (canonical when present)
-#   plan.tsv      verb<TAB>flags<TAB>fname<TAB>src<TAB>dst<TAB>account<TAB>org
+# Intermediate state lives in $WORK_DIR (a mktemp dir, removed on exit):
+#   real_orgs.tsv   account<TAB>orgPath   (org dirs still needing absorb)
+#   have_ids.txt    cliSessionIds that already have a list entry
+#   heal_list.txt   transcript paths needing a regenerated entry
 # Paths contain spaces ("Application Support") but never tabs or newlines,
 # so TSV is a safe interchange format as long as every expansion is quoted.
 
-build_inventory() {
-  # Pass 1: one row per index file with the two fields sync decisions need.
-  # The tree holds ~6,300 files; expanding one glob over all of them onto a
-  # single command line exceeds macOS ARG_MAX ("Argument list too long").
-  # So: globs write NUL-separated paths to a file, and xargs -0 feeds them
-  # to awk in as many batches as fit.
-  : > "$WORK_DIR/paths.nul"
-  : > "$WORK_DIR/orgdirs.tsv"
+claude_desktop_running() {
+  # The restructure moves the app's live data dirs, so it may only run
+  # while Claude Desktop is fully closed. A test tree (env override) is
+  # invisible to the real app, so the guard does not apply there.
+  [ -n "${CLAUDE_SYNC_SESSIONS_DIR:-}" ] && return 1
+  pgrep -x "Claude" > /dev/null 2>&1
+}
 
+session_ts() {
+  # lastActivityAt of one list file (0 if absent). The JSON is a compact
+  # single line with no trailing newline, so RS is a byte that never
+  # appears in the file: one file, exactly one awk record.
+  awk 'BEGIN { RS = "\3" }
+    { if (match($0, /"lastActivityAt":[0-9]+/))
+        print substr($0, RSTART + 17, RLENGTH - 17) + 0
+      else
+        print 0
+      exit }' "$1"
+}
+
+find_real_orgs() {
+  # account-name<TAB>org-path for every org subfolder that is still a real
+  # directory (first run, or a fresh folder the app created after logging
+  # in to a new account/org). Symlinks never qualify: ours point at
+  # _shared and are already unified; foreign ones are left alone.
+  : > "$WORK_DIR/real_orgs.tsv"
   for acct in "${accounts[@]}"; do
-    acct_name=$(basename "$acct")
     for org in "$acct"/*/; do
+      org="${org%/}"
+      [ -e "$org" ] || continue
+      [ -L "$org" ] && continue
       [ -d "$org" ] || continue
-      printf '%s\t%s\t%s\n' "$acct_name" "$(basename "$org")" "${org%/}" >> "$WORK_DIR/orgdirs.tsv"
-      for f in "$org"local_*.json; do
-        [ -f "$f" ] || continue
-        printf '%s\0' "$f" >> "$WORK_DIR/paths.nul"
-      done
+      printf '%s\t%s\n' "$(basename "$acct")" "$org" >> "$WORK_DIR/real_orgs.tsv"
     done
   done
-
-  : > "$WORK_DIR/inv.tsv"
-  [ -s "$WORK_DIR/paths.nul" ] || return 0
-
-  # Index JSON is compact single-line with NO trailing newline, so line-based
-  # reading would miss the record. RS is set to a byte that never appears in
-  # the files, making each file exactly one awk record (FNR==1). Account and
-  # org are the last two directory components of the path.
-  xargs -0 awk -v OFS='\t' '
-    BEGIN { RS = "\3" }
-    FNR == 1 {
-      n = split(FILENAME, comp, "/")
-      ts = 0
-      if (match($0, /"lastActivityAt":[0-9]+/)) {
-        t = substr($0, RSTART, RLENGTH)
-        sub(/^"lastActivityAt":/, "", t)
-        ts = t + 0
-      }
-      print comp[n], ts, ($0 ~ /"isArchived":true/) ? 1 : 0, comp[n-2], comp[n-1], FILENAME
-    }
-  ' < "$WORK_DIR/paths.nul" >> "$WORK_DIR/inv.tsv"
 }
 
-reduce_winners() {
-  # Pass 2: per session (fname), the newest copy wins (ties: first seen),
-  # and archived state is OR-ed across all copies. The OR is deliberate:
-  # archived in even one account means archived everywhere. Known accepted
-  # caveat: un-archiving cannot propagate in v2.
-  awk -F'\t' -v OFS='\t' '
-    {
-      f = $1; ts = $2 + 0
-      if (!(f in wts)) { order[++n] = f; wts[f] = ts; warch[f] = $3; wpath[f] = $6 }
-      else if (ts > wts[f]) { wts[f] = ts; warch[f] = $3; wpath[f] = $6 }
-      if ($3 == 1) aor[f] = 1
-    }
-    END {
-      for (i = 1; i <= n; i++) {
-        f = order[i]
-        print f, wts[f], (f in aor) ? 1 : 0, warch[f], wpath[f]
-      }
-    }
-  ' "$WORK_DIR/inv.tsv" > "$WORK_DIR/winners.tsv"
+backup_sessions_tree() {
+  # Whole-tree safety net, taken before any restructure. -RP copies
+  # symlinks as symlinks (a later absorb run backs up an already-linked
+  # tree). The manifest row lets --revert restore the tree verbatim.
+  ensure_run_dir
+  cp -RP "$SESSIONS_DIR" "$RUN_DIR/claude-code-sessions" || return 1
+  printf 'tree\t%s\t%s\n' "$SESSIONS_DIR" "$RUN_DIR/claude-code-sessions" >> "$MANIFEST"
 }
 
-stage_archived() {
-  # Sessions archived somewhere but whose winner says "isArchived":false get
-  # a staged copy with the flag flipped; the staged file becomes the
-  # canonical source. The pattern occurs exactly once (machine-generated
-  # JSON), and command substitution strips any trailing newline sed adds,
-  # preserving the exact no-trailing-newline format. touch -r keeps the
-  # winner's mtime on the staged copy so copy mtimes stay meaningful.
-  mkdir -p "$WORK_DIR/staged"
-  while IFS=$'\t' read -r fname ts aor warch wpath; do
-    if [ "$aor" = "1" ] && [ "$warch" = "0" ]; then
-      printf '%s' "$(sed 's/"isArchived":false/"isArchived":true/' "$wpath")" > "$WORK_DIR/staged/$fname"
-      touch -r "$wpath" "$WORK_DIR/staged/$fname"
+absorb_org_dir() {
+  # $1 = account name, $2 = org dir path. Move every list file into
+  # _shared (name collision: the copy with the newer lastActivityAt wins;
+  # the loser is dropped, the tree backup keeps it), park anything
+  # unexpected in the run's backup dir, then swap the emptied dir for a
+  # relative symlink. Any failure leaves the dir real; the next run
+  # retries.
+  acct_name="$1"
+  org_path="$2"
+  org_name=$(basename "$org_path")
+  absorbed=0
+  for f in "$org_path"/local_*.json; do
+    [ -f "$f" ] || continue
+    fname=$(basename "$f")
+    if [ -f "$SHARED_DIR/$fname" ]; then
+      if [ "$(session_ts "$f")" -gt "$(session_ts "$SHARED_DIR/$fname")" ]; then
+        cp -p "$f" "$SHARED_DIR/$fname"
+      fi
+      rm -f "$f"
+    else
+      mv "$f" "$SHARED_DIR/$fname"
     fi
-  done < "$WORK_DIR/winners.tsv"
+    absorbed=$((absorbed + 1))
+  done
+  # Unexpected leftovers (a .DS_Store, anything else) are parked in the
+  # run's backup dir, never deleted.
+  for f in "$org_path"/* "$org_path"/.[!.]*; do
+    { [ -e "$f" ] || [ -L "$f" ]; } || continue
+    mkdir -p "$RUN_DIR/leftovers/$acct_name/$org_name"
+    mv "$f" "$RUN_DIR/leftovers/$acct_name/$org_name/" || return 1
+  done
+  rmdir "$org_path" || return 1
+  # The link lives at <sessions>/<acct>/<org>, so it resolves relative to
+  # <acct>: ../_shared lands on <sessions>/_shared. Relative on purpose,
+  # so a moved or renamed home directory cannot orphan the links.
+  ln -s "../_shared" "$org_path" || return 1
+  log "  $acct_name/$org_name: absorbed $absorbed file(s), now a symlink to _shared"
 }
 
-build_plan() {
-  # Cross every destination org dir with every session, decide from the
-  # inventory alone (files are never re-read here). Flags mark why, per
-  # session, for honest counting later: n=new somewhere, u=updated to a
-  # newer state, a=archived state propagated.
-  # A staged (archive-flipped) canonical differs from every non-archived
-  # copy, so such destinations are updated even when their ts equals the
-  # winner's.
-  awk -F'\t' -v OFS='\t' \
-      -v WIN="$WORK_DIR/winners.tsv" -v INV="$WORK_DIR/inv.tsv" \
-      -v STAGED="$WORK_DIR/staged" '
-    FILENAME == WIN {
-      f = $1
-      order[++n] = f
-      wts[f] = $2 + 0; aor[f] = $3 + 0
-      src[f] = ($3 + 0 == 1 && $4 + 0 == 0) ? STAGED "/" f : $5
-      next
-    }
-    FILENAME == INV {
-      key = $4 SUBSEP $5 SUBSEP $1
-      its[key] = $2 + 0; iarch[key] = $3 + 0
-      next
-    }
-    { m++; od_acct[m] = $1; od_org[m] = $2; od_path[m] = $3 }
-    END {
-      for (j = 1; j <= m; j++) {
-        for (i = 1; i <= n; i++) {
-          f = order[i]
-          key = od_acct[j] SUBSEP od_org[j] SUBSEP f
-          dst = od_path[j] "/" f
-          if (!(key in its)) {
-            print "create", "n", f, src[f], dst, od_acct[j], od_org[j]
-          } else {
-            flags = ""
-            if (its[key] < wts[f]) flags = "u"
-            if (aor[f] == 1 && iarch[key] == 0) flags = flags "a"
-            if (flags != "")
-              print "overwrite", flags, f, src[f], dst, od_acct[j], od_org[j]
+unify_sessions() {
+  # One-time restructure, and the absorber for any fresh real folder the
+  # app creates later. Idempotent: an already-linked tree has no real org
+  # dirs and this is a no-op.
+  mode="$1"
+  find_real_orgs
+  [ -s "$WORK_DIR/real_orgs.tsv" ] || return 0
+
+  if [ "$mode" = "dry" ]; then
+    while IFS=$'\t' read -r acct_name org_path; do
+      n=0
+      for f in "$org_path"/local_*.json; do
+        [ -f "$f" ] && n=$((n + 1))
+      done
+      echo "  ${DIM}would absorb${RESET} $acct_name/$(basename "$org_path") ($n file(s)) ${DIM}into _shared and replace it with a symlink${RESET}"
+    done < "$WORK_DIR/real_orgs.tsv"
+    return 0
+  fi
+
+  if claude_desktop_running; then
+    log "Claude Desktop is running. The session-list restructure moves its"
+    log "live folders, so quit Claude Desktop completely (Cmd+Q, all"
+    log "profiles) and run claude-sync again. Nothing was changed."
+    return 1
+  fi
+
+  if ! backup_sessions_tree; then
+    log "Backup of $SESSIONS_DIR failed; not touching it."
+    return 1
+  fi
+  mkdir -p "$SHARED_DIR"
+  log "Unifying session lists into _shared..."
+  while IFS=$'\t' read -r acct_name org_path; do
+    if ! absorb_org_dir "$acct_name" "$org_path"; then
+      log "  ${YELLOW}could not fully absorb $org_path; left as a real dir (next run retries)${RESET}"
+    fi
+  done < "$WORK_DIR/real_orgs.tsv"
+  return 0
+}
+
+# Self-heal runs in osascript's JS runtime (no deps), one invocation per
+# sync. argv: [0] "plan"|"write"  [1] _shared dir  [2] path of a file
+# listing one transcript path per line. Per transcript: cwd, createdAt and
+# the title come from the first ~200 lines (title = first real user
+# message, XML-ish command wrappers and "Caveat:" preambles skipped; model
+# from the first assistant message), lastActivityAt from the last lines.
+# "write" creates _shared/local_<id>.json compact, no trailing newline,
+# exactly like the app's own files, and refuses to overwrite an existing
+# entry. Output per transcript: "MK<TAB>fname<TAB>title" or
+# "SKIP<TAB>id<TAB>reason".
+HEAL_JS='function run(argv) {
+  ObjC.import("Foundation");
+  function read(p) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError($(p), $.NSUTF8StringEncoding, $());
+    return s.isNil() ? null : ObjC.unwrap(s);
+  }
+  function write(p, s) {
+    $(s).writeToFileAtomicallyEncodingError($(p), true, $.NSUTF8StringEncoding, $());
+  }
+  var mode = argv[0], shared = argv[1], listText = read(argv[2]);
+  if (!listText) return "";
+  var paths = listText.split("\n");
+  var out = [];
+  for (var i = 0; i < paths.length; i++) {
+    var p = paths[i];
+    if (!p) continue;
+    var base = p.split("/").pop();
+    var id = base.replace(/\.jsonl$/, "");
+    var t = read(p);
+    if (!t) { out.push("SKIP\t" + id + "\tunreadable"); continue; }
+    var lines = t.split("\n");
+    var cwd = "", model = "", title = "", created = 0, last = 0, sawUser = false;
+    var head = Math.min(lines.length, 200);
+    for (var j = 0; j < head; j++) {
+      if (!lines[j]) continue;
+      var o;
+      try { o = JSON.parse(lines[j]); } catch (e) { continue; }
+      if (!cwd && o.cwd) cwd = String(o.cwd);
+      var ts = o.timestamp ? Date.parse(o.timestamp) : 0;
+      if (ts > 0) {
+        if (!created || ts < created) created = ts;
+        if (ts > last) last = ts;
+      }
+      if (!model && o.message && o.message.model) model = String(o.message.model);
+      if (!title && o.type == "user" && o.message && o.message.content != null) {
+        sawUser = true;
+        var c = o.message.content, txt = "";
+        if (typeof c == "string") txt = c;
+        else if (Array.isArray(c)) {
+          for (var q = 0; q < c.length; q++) {
+            if (c[q] && c[q].type == "text" && c[q].text) { txt = String(c[q].text); break; }
           }
         }
-      }
-    }
-  ' "$WORK_DIR/winners.tsv" "$WORK_DIR/inv.tsv" "$WORK_DIR/orgdirs.tsv" > "$WORK_DIR/plan.tsv"
-}
-
-compute_deletions() {
-  # Skipped only under --no-deletes. Finds sessions that qualify for
-  # deletion everywhere (per the addendum's four-part rule) using nothing
-  # but inv.tsv (this run's inventory), the ledger (last full-sync record),
-  # and the account list. Writes:
-  #   deletions.tsv   fname of every qualifying session (one per line)
-  #   delete_rows.tsv verb=delete plan rows for every surviving copy, in the
-  #                   same 7-column shape build_plan emits, so execute_plan
-  #                   needs no new parsing logic.
-  # Kept-by-activity-guard sessions get one explanatory log line each,
-  # printed immediately (dry-run uses echo, real runs use log: same "emit"
-  # convention as plan_summary).
-  emit="$1"
-  : > "$WORK_DIR/accounts.tsv"
-  for a in "${accounts[@]}"; do
-    basename "$a" >> "$WORK_DIR/accounts.tsv"
-  done
-
-  : > "$WORK_DIR/ledger_clean.tsv"
-  if [ -f "$LEDGER" ]; then
-    # Skip malformed rows outright: wrong column count or non-numeric ts
-    # must never be treated as a match (addendum safety invariant).
-    awk -F'\t' 'NF == 2 && $2 ~ /^[0-9]+$/ { print }' "$LEDGER" > "$WORK_DIR/ledger_clean.tsv"
-  fi
-
-  # The denominator for "present everywhere" is the INTERSECTION of two
-  # account sets, because each set alone has a catastrophic failure mode:
-  # - Accounts recorded at the ledger's last "everywhere" computation
-  #   (LEDGER_ACCOUNTS). Without this, a brand-new account joining after
-  #   the ledger was written makes every already-ledgered session look
-  #   "absent" from it and qualifies the whole history for deletion on the
-  #   new account's very first sync.
-  # - Accounts that exist on disk RIGHT NOW (the live list). Without this,
-  #   a ledgered account whose dir disappears entirely (logout, rename,
-  #   removal) contributes zero inventory rows, so every session idle since
-  #   the last sync looks "absent from a ledgered account" and gets deleted
-  #   everywhere: mass data loss from an account-level event, not a
-  #   per-session deletion.
-  # Only accounts in BOTH sets count toward nacc and absence checks. An
-  # empty intersection means nacc=0, so pcount >= nacc always holds and no
-  # session can qualify: fail safe. Missing LEDGER_ACCOUNTS (no successful
-  # sync yet) is the same empty-set, zero-candidates case.
-  : > "$WORK_DIR/ledger_accounts_clean.tsv"
-  if [ -f "$LEDGER_ACCOUNTS" ]; then
-    cp "$LEDGER_ACCOUNTS" "$WORK_DIR/ledger_accounts_clean.tsv"
-  fi
-
-  : > "$WORK_DIR/deletions.tsv"
-  : > "$WORK_DIR/kept_by_guard.tsv"
-  awk -F'\t' -v OFS='\t' \
-      -v LACCTS="$WORK_DIR/ledger_accounts_clean.tsv" -v LIVEACCTS="$WORK_DIR/accounts.tsv" \
-      -v LEDGER="$WORK_DIR/ledger_clean.tsv" \
-      -v DELFN="$WORK_DIR/deletions.tsv" -v KEPTLOG="$WORK_DIR/kept_by_guard.tsv" '
-    BEGIN {
-      while ((getline line < LIVEACCTS) > 0) live_acctset[line] = 1
-      close(LIVEACCTS)
-      nacc = 0
-      while ((getline line < LACCTS) > 0) {
-        if (line in live_acctset && !(line in ledger_acctset)) {
-          ledger_acctset[line] = 1
-          nacc++
+        txt = txt.replace(/\s+/g, " ").replace(/^ +| +$/g, "");
+        if (txt && txt.charAt(0) != "<" && txt.indexOf("Caveat:") != 0) {
+          title = txt.length > 60 ? txt.slice(0, 60) + "..." : txt;
         }
       }
-      close(LACCTS)
-      while ((getline line < LEDGER) > 0) {
-        split(line, p, "\t")
-        ledger_ts[p[1]] = p[2] + 0
-        in_ledger[p[1]] = 1
+    }
+    if (!sawUser) { out.push("SKIP\t" + id + "\tno user message"); continue; }
+    for (var j = lines.length - 1; j >= 0 && j >= lines.length - 20; j--) {
+      if (!lines[j]) continue;
+      var o2;
+      try { o2 = JSON.parse(lines[j]); } catch (e) { continue; }
+      var ts2 = o2.timestamp ? Date.parse(o2.timestamp) : 0;
+      if (ts2 > last) last = ts2;
+      if (ts2 > 0) break;
+    }
+    if (!created) { out.push("SKIP\t" + id + "\tno timestamps"); continue; }
+    if (!last) last = created;
+    if (!title) title = "Recovered: " + (cwd ? cwd.split("/").pop() : id.slice(0, 8));
+    var entry = {
+      sessionId: "local_" + id, cliSessionId: id,
+      cwd: cwd, originCwd: cwd,
+      createdAt: created, lastActivityAt: last, lastFocusedAt: last,
+      isArchived: false, title: title, titleSource: "auto",
+      permissionMode: "default", enabledMcpTools: {}
+    };
+    if (model) entry.model = model;
+    var dst = shared + "/local_" + id + ".json";
+    if (mode == "write") {
+      if ($.NSFileManager.defaultManager.fileExistsAtPath($(dst))) {
+        out.push("SKIP\t" + id + "\tentry exists");
+        continue;
       }
-      close(LEDGER)
+      write(dst, JSON.stringify(entry));
     }
-    {
-      f = $1; ts = $2 + 0; acct = $4
-      if (!(f in seen)) { order[++n] = f; seen[f] = 1 }
-      # The activity guard looks at ALL surviving copies (addendum: "max
-      # over ALL surviving copies"), including one in a brand-new account.
-      if (!(f in maxts) || ts > maxts[f]) maxts[f] = ts
-      # Presence/absence, though, is only judged against the intersection
-      # set -- see the comment above this awk block for why.
-      if (!(acct in ledger_acctset)) next
-      key = f SUBSEP acct
-      if (!(key in present)) { present[key] = 1; pcount[f]++ }
-    }
-    END {
-      # Sessions gone from every ledgered account never reach this loop at
-      # all (no inv.tsv rows anywhere for that fname); they simply fall out
-      # of the ledger rewrite. nacc == 0 (empty intersection) makes the
-      # pcount test below always skip: zero candidates, fail safe.
-      for (i = 1; i <= n; i++) {
-        f = order[i]
-        if (!(f in in_ledger)) continue      # never fully synced: never delete
-        if (pcount[f] >= nacc) continue      # present in every counted account
-        if (maxts[f] > ledger_ts[f]) { print f >> KEPTLOG; continue }
-        print f >> DELFN
-      }
-    }
-  ' "$WORK_DIR/inv.tsv"
+    out.push("MK\tlocal_" + id + ".json\t" + title);
+  }
+  return out.join("\n");
+}'
 
-  if [ -s "$WORK_DIR/kept_by_guard.tsv" ]; then
-    while IFS= read -r f; do
-      "$emit" "Kept $f everywhere: a surviving copy is newer than the last full sync, so the deletion may predate that activity."
-    done < "$WORK_DIR/kept_by_guard.tsv"
+heal_missing_entries() {
+  # Recreate lost list entries from transcripts. Read-only towards
+  # ~/.claude; additive-only towards _shared. Runs every pass.
+  mode="$1"
+  [ -d "$PROJECTS_DIR" ] || return 0
+  if [ "$mode" != "dry" ] && [ ! -d "$SHARED_DIR" ]; then
+    return 0
   fi
 
-  : > "$WORK_DIR/delete_rows.tsv"
-  if [ -s "$WORK_DIR/deletions.tsv" ]; then
-    # flags/src are placeholder "-", never empty: bash's `read` with
-    # IFS=$'\t' still treats tab as whitespace-class and silently squeezes
-    # consecutive-tab (empty-field) runs, which shifts every column after
-    # the gap. create/overwrite rows never hit this (their fields are never
-    # empty); delete rows have no meaningful flags or src, so use "-".
-    awk -F'\t' -v OFS='\t' -v DELFN="$WORK_DIR/deletions.tsv" '
-      FILENAME == DELFN { want[$1] = 1; next }
-      { if ($1 in want) print "delete", "-", $1, "-", $6, $4, $5 }
-    ' "$WORK_DIR/deletions.tsv" "$WORK_DIR/inv.tsv" > "$WORK_DIR/delete_rows.tsv"
-  fi
-}
-
-update_ledger() {
-  # Called at the end of EVERY successful non-dry sync, flag or not (the
-  # ledger is what makes a future deletion pass able to tell "deleted"
-  # apart from "never synced here yet"). Records fname + winner ts for every
-  # session present, after this run's writes, in every account. Reads the
-  # post-execute state from disk rather than trusting the pre-run inventory,
-  # so a run that only partially completes cannot write a false row.
-  # Written atomically (temp file + mv) so a crash mid-write never leaves a
-  # truncated ledger; a missing/empty ledger is a normal, safe starting
-  # state.
-  : > "$WORK_DIR/post_paths.nul"
-  for acct in "${accounts[@]}"; do
-    for org in "$acct"/*/; do
-      [ -d "$org" ] || continue
-      for f in "$org"local_*.json; do
-        [ -f "$f" ] || continue
-        printf '%s\0' "$f" >> "$WORK_DIR/post_paths.nul"
-      done
-    done
+  # ids that already have a list entry: in _shared, or (when previewing a
+  # not-yet-unified tree) in any real org dir.
+  : > "$WORK_DIR/have_ids.txt"
+  for f in "$SHARED_DIR"/local_*.json "$SESSIONS_DIR"/*/*/local_*.json; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f" .json)
+    echo "${b#local_}" >> "$WORK_DIR/have_ids.txt"
   done
 
-  : > "$WORK_DIR/post_inv.tsv"
-  if [ -s "$WORK_DIR/post_paths.nul" ]; then
-    xargs -0 awk -v OFS='\t' '
-      BEGIN { RS = "\3" }
-      FNR == 1 {
-        n = split(FILENAME, comp, "/")
-        ts = 0
-        if (match($0, /"lastActivityAt":[0-9]+/)) {
-          t = substr($0, RSTART, RLENGTH)
-          sub(/^"lastActivityAt":/, "", t)
-          ts = t + 0
-        }
-        print comp[n], ts, comp[n-2]
-      }
-    ' < "$WORK_DIR/post_paths.nul" >> "$WORK_DIR/post_inv.tsv"
-  fi
-
-  : > "$WORK_DIR/accounts.tsv"
-  for a in "${accounts[@]}"; do
-    basename "$a" >> "$WORK_DIR/accounts.tsv"
+  : > "$WORK_DIR/want.tsv"
+  for tr in "$PROJECTS_DIR"/*/*.jsonl; do
+    [ -f "$tr" ] || continue
+    printf '%s\t%s\n' "$(basename "$tr" .jsonl)" "$tr" >> "$WORK_DIR/want.tsv"
   done
+  [ -s "$WORK_DIR/want.tsv" ] || return 0
 
-  ledger_tmp="$CANONICAL_DIR/.ledger.tmp.$$"
-  mkdir -p "$CANONICAL_DIR"
-  awk -F'\t' -v OFS='\t' -v ACCTS="$WORK_DIR/accounts.tsv" '
-    BEGIN {
-      nacc = 0
-      while ((getline line < ACCTS) > 0) nacc++
-      close(ACCTS)
-    }
-    {
-      f = $1; ts = $2 + 0; acct = $3
-      if (!(f in seen)) { order[++n] = f; seen[f] = 1 }
-      key = f SUBSEP acct
-      if (!(key in present)) { present[key] = 1; pcount[f]++ }
-      if (!(f in maxts) || ts > maxts[f]) maxts[f] = ts
-    }
-    END {
-      for (i = 1; i <= n; i++) {
-        f = order[i]
-        if (pcount[f] >= nacc) print f, maxts[f]
-      }
-    }
-  ' "$WORK_DIR/post_inv.tsv" > "$ledger_tmp"
-  mv "$ledger_tmp" "$LEDGER"
+  awk -F'\t' -v HAVE="$WORK_DIR/have_ids.txt" '
+    BEGIN { while ((getline line < HAVE) > 0) have[line] = 1; close(HAVE) }
+    !($1 in have) { print $2 }
+  ' "$WORK_DIR/want.tsv" > "$WORK_DIR/heal_list.txt"
+  [ -s "$WORK_DIR/heal_list.txt" ] || return 0
 
-  # Record which accounts this ledger considers "everywhere", so a future
-  # deletion pass can tell a brand-new account (not part of this set)
-  # apart from an account that genuinely had a ledgered session removed.
-  accts_tmp="$CANONICAL_DIR/.ledger-accounts.tmp.$$"
-  cp "$WORK_DIR/accounts.tsv" "$accts_tmp"
-  mv "$accts_tmp" "$LEDGER_ACCOUNTS"
-}
+  jsmode="write"
+  [ "$mode" = "dry" ] && jsmode="plan"
+  heal_out=$("$OSASCRIPT" -l JavaScript -e "$HEAL_JS" "$jsmode" "$SHARED_DIR" "$WORK_DIR/heal_list.txt" 2>&1)
 
-plan_summary() {
-  # Honest counts: unique sessions, never file copies. $1 is the emit
-  # command (log for real runs, echo for dry runs). Delete rows (verb
-  # "delete") never exist under --no-deletes.
-  emit="$1"
-  total_sessions=$(awk 'END { print NR }' "$WORK_DIR/winners.tsv")
+  healed=0
+  while IFS=$'\t' read -r tag fname title; do
+    case "$tag" in
+      MK)
+        if [ "$mode" = "dry" ]; then
+          echo "  ${DIM}would recreate list entry${RESET} $fname (\"$title\")"
+        else
+          ensure_run_dir
+          printf 'created\t%s\n' "$SHARED_DIR/$fname" >> "$MANIFEST"
+          log "  recreated list entry $fname (\"$title\")"
+          healed=$((healed + 1))
+        fi
+        ;;
+      SKIP)
+        [ "$mode" = "dry" ] && echo "  ${DIM}skip transcript $fname: $title${RESET}"
+        ;;
+    esac
+  done <<EOF_HEAL
+$heal_out
+EOF_HEAL
 
-  # Per-account one-liners, also session-level. Branch explicitly on verb so
-  # "delete" rows are never lumped into "updated" (the old code's implicit
-  # else assumed only create/overwrite existed).
-  awk -F'\t' '
-    {
-      ak = $6 SUBSEP $3
-      accts[$6] = 1
-      if ($1 == "create")      { if (!(ak in cN)) { cN[ak] = 1; accN[$6]++ } }
-      else if ($1 == "delete") { if (!(ak in cD)) { cD[ak] = 1; accD[$6]++ } }
-      else                     { if (!(ak in cU)) { cU[ak] = 1; accU[$6]++ } }
-    }
-    END {
-      for (a in accts) {
-        line = sprintf("  %s: +%d new, %d updated", a, accN[a] + 0, accU[a] + 0)
-        if (accD[a] + 0 > 0) line = line sprintf(", -%d deleted", accD[a] + 0)
-        print line
-      }
-    }
-  ' "$WORK_DIR/plan.tsv" | sort | while IFS= read -r line; do
-    "$emit" "$line"
-  done
-
-  counts=$(awk -F'\t' '
-    {
-      if ($1 == "create")    newf[$3] = 1
-      if (index($2, "u"))    upd[$3] = 1
-      if (index($2, "a"))    arc[$3] = 1
-      if ($1 == "delete")    del[$3] = 1
-    }
-    END {
-      x = 0; for (k in newf) x++
-      y = 0; for (k in upd) y++
-      z = 0; for (k in arc) z++
-      w = 0; for (k in del) w++
-      print x, y, z, w
-    }
-  ' "$WORK_DIR/plan.tsv")
-  read -r n_new n_upd n_arc n_del <<< "$counts"
-
-  summary="$n_new new session(s) appeared somewhere, $n_upd session(s) updated to a newer state, $n_arc session(s) archived everywhere (was archived in at least one account)"
-  if [ "$n_del" -gt 0 ]; then
-    summary="$summary, $n_del session(s) deleted everywhere (deleted in at least one account)"
+  if [ "$healed" -gt 0 ]; then
+    log "Self-heal: $healed lost session(s) restored to the list."
   fi
-  "$emit" "$summary. $total_sessions total sessions across ${#accounts[@]} accounts."
+  return 0
 }
 
-execute_plan() {
-  # Every write is recorded in the run's manifest; overwrites are backed up
-  # first (mirroring <account>/<org>/ so --revert can put them back).
-  # cp -p everywhere: plain cp resets mtime, which would make copies look
-  # newer than they are on later inspection. The run dir may already exist
-  # if the profile layer wrote first; both layers share one manifest.
-  ensure_run_dir
-
-  while IFS=$'\t' read -r verb flags fname src dst acct org; do
-    if [ "$verb" = "create" ] && [ ! -f "$dst" ]; then
-      cp -p "$src" "$dst"
-      printf 'created\t%s\n' "$dst" >> "$MANIFEST"
-    elif [ "$verb" = "delete" ]; then
-      # Skipped under --no-deletes. Back up first (same mirrored
-      # layout as an overwrite backup), then remove. A dst that vanished
-      # between planning and here (already gone) is treated as done.
-      if [ -f "$dst" ]; then
-        mkdir -p "$RUN_DIR/$acct/$org"
-        cp -p "$dst" "$RUN_DIR/$acct/$org/$fname"
-        rm -f "$dst"
-        printf 'deleted\t%s\t%s\n' "$dst" "$RUN_DIR/$acct/$org/$fname" >> "$MANIFEST"
-      fi
-    else
-      # Overwrite (or a "create" whose destination appeared after the
-      # inventory pass): back the current file up first.
-      mkdir -p "$RUN_DIR/$acct/$org"
-      cp -p "$dst" "$RUN_DIR/$acct/$org/$fname"
-      cp -p "$src" "$dst"
-      printf 'overwrote\t%s\t%s\n' "$dst" "$RUN_DIR/$acct/$org/$fname" >> "$MANIFEST"
-    fi
-  done < "$WORK_DIR/plan.tsv"
+sync_sessions() {
+  # Orchestrates the session layer: unify (when needed), then self-heal.
+  mode="$1"
+  collect_accounts
+  if [ ${#accounts[@]} -eq 0 ]; then
+    log "No account folders in $SESSIONS_DIR yet; nothing to unify."
+    return 0
+  fi
+  unify_sessions "$mode" || return 1
+  heal_missing_entries "$mode"
+  if [ "$mode" != "dry" ] && [ -d "$SHARED_DIR" ]; then
+    log "Session list: $(count_shared_entries) entries in _shared, seen by all ${#accounts[@]} account(s)."
+  fi
+  return 0
 }
-
 prune_backups() {
   # Keep the newest $BACKUP_KEEP runs. Run dirs are named by epoch (plus a
   # ".reverted" suffix after a revert), so a numeric sort of basenames
@@ -822,11 +716,9 @@ do_sync() {
 }
 
 sync_run() {
-  # $1 = "dry" for --dry-run: full inventory + plan, print every action,
-  # write nothing (no backups, no log, no ledger).
-  # $2 = "nodeletes" for --no-deletes. Deletion propagation is the DEFAULT
-  # (v2.3): omitted or anything else means deletes are on, so the watcher
-  # and a plain `claude-sync` both propagate deletions.
+  # $1 = "dry" for --dry-run: narrate every action, write nothing.
+  # $2 = "nodeletes" for --no-deletes; since v4 it only affects the MCP
+  # server layer (one physical session list has no deletions to sync).
   mode="${1:-}"
   sync_deletes="${2:-deletes}"
   [ "$sync_deletes" != "nodeletes" ] && sync_deletes="deletes"
@@ -841,79 +733,34 @@ sync_run() {
     return 1
   fi
 
-  collect_accounts
-
-  if [ ${#accounts[@]} -lt 2 ]; then
-    log "Only one account folder found. Nothing to sync."
-    log "Tip: log in to your other account in Claude Desktop, start one"
-    log "throwaway Claude Code session (a plain 'hi' is enough), quit Claude,"
-    log "then run claude-sync again."
-    return 0
-  fi
-
-  build_inventory
-  reduce_winners
-  stage_archived
-
-  : > "$WORK_DIR/deletions.tsv"
-  : > "$WORK_DIR/delete_rows.tsv"
-  if [ "$sync_deletes" = "deletes" ]; then
-    if [ "$mode" = "dry" ]; then
-      compute_deletions echo
-    else
-      compute_deletions log
-    fi
-    if [ -s "$WORK_DIR/deletions.tsv" ]; then
-      # Deletion candidates must never be resurrected by this same run:
-      # drop them from winners before build_plan ever sees them.
-      awk -F'\t' -v OFS='\t' -v DELFN="$WORK_DIR/deletions.tsv" '
-        FILENAME == DELFN { drop[$1] = 1; next }
-        !($1 in drop)
-      ' "$WORK_DIR/deletions.tsv" "$WORK_DIR/winners.tsv" > "$WORK_DIR/winners.filtered.tsv"
-      mv "$WORK_DIR/winners.filtered.tsv" "$WORK_DIR/winners.tsv"
-    fi
-  fi
-
-  build_plan
-
-  if [ -s "$WORK_DIR/delete_rows.tsv" ]; then
-    cat "$WORK_DIR/delete_rows.tsv" >> "$WORK_DIR/plan.tsv"
-  fi
-
-  if [ ! -s "$WORK_DIR/plan.tsv" ]; then
-    total_sessions=$(awk 'END { print NR }' "$WORK_DIR/winners.tsv")
-    if [ "$mode" = "dry" ]; then
-      echo "Dry run: everything already in sync. $total_sessions total sessions across ${#accounts[@]} accounts."
-    else
-      log "Everything already in sync. $total_sessions total sessions across ${#accounts[@]} accounts."
-      update_ledger
-    fi
-    return 0
-  fi
-
   if [ "$mode" = "dry" ]; then
-    echo "Dry run across ${#accounts[@]} accounts. Planned actions:"
-    while IFS=$'\t' read -r verb flags fname src dst acct org; do
-      echo "  ${DIM}would $verb:${RESET} $dst"
-    done < "$WORK_DIR/plan.tsv"
-    plan_summary echo
+    echo "Dry run. Planned session actions:"
+    sync_sessions "dry"
+    rc=$?
     echo "${DIM}Nothing was written.${RESET}"
-    return 0
+    return $rc
   fi
 
-  log "Syncing sessions across ${#accounts[@]} accounts..."
-  execute_plan
-  prune_backups
-  plan_summary log
-  update_ledger
-  log "Sync complete. Backup: $RUN_DIR ${DIM}(claude-sync --revert undoes this run)${RESET}"
+  sync_sessions "$mode" || return 1
+  if [ -n "${RUN_DIR:-}" ]; then
+    prune_backups
+    log "Sync complete. Backup: $RUN_DIR ${DIM}(claude-sync --revert undoes this run)${RESET}"
+  else
+    log "Sync complete. Nothing needed writing."
+  fi
   return 0
 }
 
 cmd_revert() {
-  # Undo the most recent sync run: delete files it created, restore files
-  # it overwrote, then mark the backup dir .reverted so a second --revert
-  # targets the run before it.
+  # Undo the most recent sync run, then mark its backup dir .reverted so a
+  # second --revert targets the run before it.
+  # A run that restructured the session tree left a 'tree' manifest row:
+  # the whole claude-code-sessions tree is restored from that backup
+  # verbatim (real folders again, no symlinks, no _shared). List entries
+  # born AFTER the backup (the app kept writing into _shared) are salvaged
+  # into every restored org folder first, so no session disappears.
+  # Rows inside the session tree are covered by the tree restore and are
+  # skipped; config/extension rows are undone as before.
   [ -d "$BACKUPS_DIR" ] || die "No backups found ($BACKUPS_DIR). Nothing to revert."
 
   latest=""
@@ -928,9 +775,66 @@ cmd_revert() {
   done
   [ -n "$latest" ] || die "No backup run left to revert."
 
+  tree_path=""; tree_backup=""
+  while IFS=$'\t' read -r op path bpath; do
+    if [ "$op" = "tree" ]; then
+      tree_path="$path"
+      tree_backup="$bpath"
+    fi
+  done < "$latest/manifest.tsv"
+
   log "Reverting sync run $(basename "$latest")..."
+
+  restored_tree=0
+  if [ -n "$tree_backup" ]; then
+    [ -d "$tree_backup" ] || die "Tree backup missing: $tree_backup"
+    if claude_desktop_running; then
+      die "Claude Desktop is running. Quit it completely (Cmd+Q, all profiles), then run --revert again."
+    fi
+    # Salvage: entries now in _shared that are neither in the backup nor
+    # created by this very run (i.e. the app wrote them after the backup).
+    salvage=$(mktemp -d "${TMPDIR:-/tmp}/claude-sync-salvage.XXXXXX") || die "mktemp failed"
+    n_salvage=0
+    for f in "$tree_path/_shared"/local_*.json; do
+      [ -f "$f" ] || continue
+      fname=$(basename "$f")
+      grep -qF "created"$'\t'"$f" "$latest/manifest.tsv" && continue
+      found=""
+      for g in "$tree_backup/_shared/$fname" "$tree_backup"/*/*/"$fname"; do
+        if [ -f "$g" ]; then
+          found=1
+          break
+        fi
+      done
+      [ -n "$found" ] && continue
+      cp -p "$f" "$salvage/$fname"
+      n_salvage=$((n_salvage + 1))
+    done
+
+    rm -rf "$tree_path"
+    cp -RP "$tree_backup" "$tree_path"
+    log "Restored $tree_path from the run's whole-tree backup."
+
+    if [ "$n_salvage" -gt 0 ]; then
+      for org in "$tree_path"/*/*/; do
+        org="${org%/}"
+        [ -L "$org" ] && continue
+        [ -d "$org" ] || continue
+        cp -p "$salvage"/local_*.json "$org"/
+      done
+      [ -d "$tree_path/_shared" ] && cp -p "$salvage"/local_*.json "$tree_path/_shared/"
+      log "Salvaged $n_salvage newer session entries into the restored folders."
+    fi
+    rm -rf "$salvage"
+    restored_tree=1
+  fi
+
   removed=0; restored=0; undeleted=0
   while IFS=$'\t' read -r op path bpath; do
+    [ "$op" = "tree" ] && continue
+    if [ "$restored_tree" = "1" ]; then
+      case "$path" in "$tree_path"/*) continue ;; esac
+    fi
     case "$op" in
       created)
         rm -f "$path"
@@ -941,9 +845,8 @@ cmd_revert() {
         restored=$((restored + 1))
         ;;
       deleted)
-        # The file does not exist at revert time (that is the point of a
-        # delete row); a plain copy-back from its backup is correct and
-        # needs no existence check, unlike "overwrote".
+        # Rows from pre-v4 backups. The file does not exist at revert time
+        # (that is the point of a delete row); a plain copy-back is right.
         cp -p "$bpath" "$path"
         undeleted=$((undeleted + 1))
         ;;
@@ -1098,13 +1001,33 @@ cmd_status() {
     echo "  ${YELLOW}(not found: open Claude Code in Claude Desktop once)${RESET}"
     return 1
   fi
+  if [ -d "$SHARED_DIR" ]; then
+    echo "  _shared: $(count_shared_entries) session list entries"
+  else
+    echo "  ${YELLOW}_shared not created yet (run claude-sync once with Claude Desktop closed)${RESET}"
+  fi
   collect_accounts
   for d in "${accounts[@]}"; do
-    echo "  account $(basename "$d"): $(count_index_files "$d") session index file(s)"
+    linked=0; real=0
+    for org in "$d"/*/; do
+      org="${org%/}"
+      [ -e "$org" ] || continue
+      if [ -L "$org" ]; then
+        linked=$((linked + 1))
+      else
+        real=$((real + 1))
+      fi
+    done
+    state="unified ($linked org symlink(s) -> _shared)"
+    [ "$real" -gt 0 ] && state="${YELLOW}$real real org folder(s) not yet unified${RESET}"
+    [ "$linked" -eq 0 ] && [ "$real" -eq 0 ] && state="empty"
+    echo "  account $(basename "$d"): $state"
   done
-  if [ -d "$SESSIONS_DIR/_shared" ]; then
-    echo "  ${DIM}_shared (not an account folder, untouched): $(count_index_files "$SESSIONS_DIR/_shared") file(s)${RESET}"
-  fi
+  n_tr=0
+  for tr in "$PROJECTS_DIR"/*/*.jsonl; do
+    [ -f "$tr" ] && n_tr=$((n_tr + 1))
+  done
+  echo "  transcripts on disk: $n_tr ${DIM}($PROJECTS_DIR)${RESET}"
   if [ -f "$CANONICAL_PATH" ]; then
     echo "Script: installed at $CANONICAL_PATH"
   else
@@ -1135,26 +1058,30 @@ cmd_status() {
 usage() {
   cat <<EOF
 claude-sync v$VERSION
-Make local Claude Code sessions visible across all Claude Desktop accounts,
-and keep customization (MCP servers, Desktop Extensions) in sync across
-profiles (claude-deck). Newest session state wins; archived-in-one means
-archived-everywhere; overwrites are backed up and revertible. Deletions
-propagate by default: delete a session in any account (or an MCP server in
-any profile) and the next sync deletes it everywhere, after a backup. MCP
-server edits propagate too: when profiles disagree on a server's
-definition, the profile config edited most recently wins. Logins, cookies,
-and preferences are never touched.
+One shared Claude Code session list for all Claude Desktop accounts: every
+<account>/<org> folder under claude-code-sessions is a symlink to one
+_shared folder, so each conversation exists once and every account sees
+it. Each run also self-heals the list: a transcript in ~/.claude/projects
+with no list entry gets one regenerated (the app sometimes loses entries
+after restarts or rewound sessions). Existing entries are never edited or
+deleted; transcripts are never touched. Customization (MCP servers,
+Desktop Extensions) still syncs across profiles (claude-deck): a server
+edited in one profile propagates, newest config wins, removals propagate
+unless --no-deletes. Logins, cookies, and preferences are never touched.
 
 Usage: claude-sync [command]
 
-  (no command)       Run the sync (deletions propagate; see --no-deletes).
+  (no command)       Run the sync. The one-time restructure into _shared
+                     needs Claude Desktop fully closed; the script stops
+                     with a message if it is running.
   --dry-run          Show what a sync would do, write nothing.
-  --no-deletes       Sync WITHOUT propagating deletions. Anything deleted on
-                     one side but alive elsewhere is copied back instead:
-                     use this to restore a session or MCP server you
-                     deleted by mistake (before the deletion has synced).
-  --revert           Undo the most recent sync run from its backup.
-  --status           Show detected accounts, session counts, install state.
+  --no-deletes       Sync WITHOUT propagating MCP server removals; a server
+                     deleted in one profile is copied back instead (the
+                     restore path for an accidental removal).
+  --revert           Undo the most recent sync run from its backup. If that
+                     run restructured the session tree, this restores the
+                     whole tree exactly as it was (Claude must be closed).
+  --status           Show unify state, entry counts, install state.
   --install          Copy this script to ~/.claude/scripts/ and register the
                      'claude-sync' alias in ~/.zshrc. Re-run to update.
   --uninstall        Remove the alias and the auto-sync agent (if enabled).
@@ -1163,13 +1090,11 @@ Usage: claude-sync [command]
   --version          Print version.
   --help             This text.
 
-Before the first sync: log in to the new account in Claude Desktop, start
-one throwaway Claude Code session ('hi' is enough), quit Claude, then sync.
-
-Warning: deletion propagation removes files after a backup, but a mistake
-can still cost you a session across every account. --revert undoes the
-last run; --dry-run previews what would be deleted; --no-deletes restores
-a not-yet-propagated deletion from the surviving copies.
+First run: quit Claude Desktop completely (Cmd+Q, every profile), then run
+claude-sync. It backs up the whole claude-code-sessions tree, moves the
+union of all list entries into _shared, and symlinks every account/org
+folder to it. After that, runs are maintenance only (absorb new account
+folders, regenerate lost entries) and are safe anytime.
 EOF
 }
 
