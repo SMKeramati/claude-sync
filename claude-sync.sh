@@ -455,10 +455,17 @@ absorb_org_dir() {
     [ -f "$f" ] || continue
     fname=$(basename "$f")
     if [ -f "$SHARED_DIR/$fname" ]; then
-      if [ "$(session_ts "$f")" -gt "$(session_ts "$SHARED_DIR/$fname")" ]; then
-        cp -p "$f" "$SHARED_DIR/$fname"
+      # v3 synced copies are usually byte-identical: cmp short-circuits
+      # the common case so we don't fork awk twice per collision (~10k
+      # files on a long-lived tree).
+      if cmp -s "$f" "$SHARED_DIR/$fname"; then
+        rm -f "$f"
+      else
+        if [ "$(session_ts "$f")" -gt "$(session_ts "$SHARED_DIR/$fname")" ]; then
+          cp -p "$f" "$SHARED_DIR/$fname"
+        fi
+        rm -f "$f"
       fi
-      rm -f "$f"
     else
       mv "$f" "$SHARED_DIR/$fname"
     fi
@@ -531,12 +538,43 @@ unify_sessions() {
 # "SKIP<TAB>id<TAB>reason".
 HEAL_JS='function run(argv) {
   ObjC.import("Foundation");
+  var HEAD = 524288, TAIL = 65536;
   function read(p) {
     var s = $.NSString.stringWithContentsOfFileEncodingError($(p), $.NSUTF8StringEncoding, $());
     return s.isNil() ? null : ObjC.unwrap(s);
   }
   function write(p, s) {
     $(s).writeToFileAtomicallyEncodingError($(p), true, $.NSUTF8StringEncoding, $());
+  }
+  function decode(data, trimStart) {
+    // A byte-offset chunk can tear a multibyte UTF-8 char at its edge and
+    // make strict decoding fail; shaving up to 3 edge bytes always yields
+    // a valid boundary. Torn half-lines then just fail JSON.parse below.
+    var len = data.length;
+    for (var k = 0; k <= 3 && k < len; k++) {
+      var sub = data.subdataWithRange($.NSMakeRange(trimStart ? k : 0, len - k));
+      var s = $.NSString.alloc.initWithDataEncoding(sub, $.NSUTF8StringEncoding);
+      if (!s.isNil()) return ObjC.unwrap(s);
+    }
+    return "";
+  }
+  function readChunks(p) {
+    // Transcripts can be tens of MB; everything the heal needs sits in
+    // the first and last lines. The file is memory-mapped (no full read)
+    // and only the head/tail byte ranges are ever decoded.
+    var d = $.NSData.dataWithContentsOfFileOptionsError($(p), $.NSDataReadingMappedIfSafe, $());
+    if (d.isNil()) return null;
+    var size = Number(d.length);
+    if (size == 0) return null;
+    if (size <= HEAD + TAIL) {
+      var whole = decode(d, false);
+      if (!whole) return null;
+      var wl = whole.split("\n");
+      return { head: wl, tail: wl };
+    }
+    var hs = decode(d.subdataWithRange($.NSMakeRange(0, HEAD)), false);
+    var ts = decode(d.subdataWithRange($.NSMakeRange(size - TAIL, TAIL)), true);
+    return { head: hs.split("\n"), tail: ts.split("\n") };
   }
   var mode = argv[0], shared = argv[1], listText = read(argv[2]);
   if (!listText) return "";
@@ -547,9 +585,9 @@ HEAL_JS='function run(argv) {
     if (!p) continue;
     var base = p.split("/").pop();
     var id = base.replace(/\.jsonl$/, "");
-    var t = read(p);
-    if (!t) { out.push("SKIP\t" + id + "\tunreadable"); continue; }
-    var lines = t.split("\n");
+    var ck = readChunks(p);
+    if (!ck) { out.push("SKIP\t" + id + "\tunreadable"); continue; }
+    var lines = ck.head;
     var cwd = "", model = "", title = "", created = 0, last = 0, sawUser = false;
     var head = Math.min(lines.length, 200);
     for (var j = 0; j < head; j++) {
@@ -579,10 +617,11 @@ HEAL_JS='function run(argv) {
       }
     }
     if (!sawUser) { out.push("SKIP\t" + id + "\tno user message"); continue; }
-    for (var j = lines.length - 1; j >= 0 && j >= lines.length - 20; j--) {
-      if (!lines[j]) continue;
+    var tl = ck.tail;
+    for (var j = tl.length - 1; j >= 0 && j >= tl.length - 20; j--) {
+      if (!tl[j]) continue;
       var o2;
-      try { o2 = JSON.parse(lines[j]); } catch (e) { continue; }
+      try { o2 = JSON.parse(tl[j]); } catch (e) { continue; }
       var ts2 = o2.timestamp ? Date.parse(o2.timestamp) : 0;
       if (ts2 > last) last = ts2;
       if (ts2 > 0) break;
@@ -621,13 +660,16 @@ heal_missing_entries() {
   fi
 
   # ids that already have a list entry: in _shared, or (when previewing a
-  # not-yet-unified tree) in any real org dir.
-  : > "$WORK_DIR/have_ids.txt"
-  for f in "$SHARED_DIR"/local_*.json "$SESSIONS_DIR"/*/*/local_*.json; do
-    [ -f "$f" ] || continue
-    b=$(basename "$f" .json)
-    echo "${b#local_}" >> "$WORK_DIR/have_ids.txt"
-  done
+  # not-yet-unified tree) in any real org dir. Parameter expansion, not
+  # basename: no fork per file (the tree can hold ~10k files).
+  {
+    for f in "$SHARED_DIR"/local_*.json "$SESSIONS_DIR"/*/*/local_*.json; do
+      [ -f "$f" ] || continue
+      b="${f##*/}"
+      b="${b%.json}"
+      printf '%s\n' "${b#local_}"
+    done
+  } > "$WORK_DIR/have_ids.txt"
 
   : > "$WORK_DIR/want.tsv"
   for tr in "$PROJECTS_DIR"/*/*.jsonl; do
