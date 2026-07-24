@@ -20,9 +20,13 @@
 #     (seen after restarts and rewound sessions), so it vanishes from the
 #     list although its transcript is intact. Every run scans
 #     ~/.claude/projects/*/*.jsonl and recreates a missing entry from the
-#     transcript itself (title from the first user message; cwd and
-#     timestamps from the transcript). Existing entries are never edited
-#     or deleted; transcripts are only ever read.
+#     transcript itself (custom title or first user message; cwd, model
+#     and timestamps from the transcript). "Missing" is judged against
+#     entry file names AND each entry's inner cliSessionId AND the heal
+#     ledger of everything ever listed, so app-created entries are never
+#     duplicated and an entry deleted in the app is never resurrected.
+#     Existing entries are never edited or deleted; transcripts are only
+#     ever read.
 #
 # It also syncs customization across PROFILES: multi-profile launchers
 # (claude-deck) give each profile its own data dir under
@@ -49,7 +53,7 @@
 #
 # https://github.com/SMKeramati/claude-sync
 
-VERSION="4.0.0"
+VERSION="4.1.0"
 
 # Absolute path: /usr/local/bin may shadow osascript with a wrapper (seen in
 # the wild: a VPN toggle shim), and LaunchAgent PATH is minimal anyway.
@@ -75,9 +79,16 @@ BACKUP_KEEP=10
 # missing from some profile now = the user removed it there, so it is
 # removed everywhere. A name absent from the ledger = new, so it is added
 # everywhere. Without this file no MCP removal can ever propagate.
-# (The v2/v3 session ledgers ledger.tsv/.ledger-accounts.tsv are obsolete:
-# one physical list needs no reconciliation. Stale copies are harmless.)
 MCP_LEDGER="$CANONICAL_DIR/mcp-ledger.tsv"
+# Heal ledger: every session id self-heal has ever seen listed (or
+# generated). An id here whose entry is gone was deleted by the user in
+# the app; without this file every deletion would be resurrected from its
+# transcript on the next run.
+HEAL_LEDGER="$CANONICAL_DIR/heal-ledger.tsv"
+# The retired v3 session ledger, read once (never written): its ids seed
+# the heal ledger, so anything deleted in the app before the v4 migration
+# stays deleted. .ledger-accounts.tsv stays obsolete and harmless.
+V3_LEDGER="$CANONICAL_DIR/ledger.tsv"
 
 RC_FILE="$HOME/.zshrc"
 RC_BEGIN="# >>> claude-sync shortcut >>>"
@@ -153,9 +164,13 @@ ensure_run_dir() {
 #   [0] mode "plan"|"write"   [1] "deletes"|"nodeletes"   [2] MCP ledger path
 #   [3..] cfg-path, mtime pairs (default root's config always first).
 # Decisions, per server name across all configs:
-#   - name in the ledger but missing from >=1 config  -> removed everywhere
-#     (only when deletes are on; with --no-deletes the missing copy is
-#     re-added instead, which is exactly the restore path),
+#   - name in the ledger but missing from >=1 config that HAS servers ->
+#     removed everywhere (only when deletes are on; with --no-deletes the
+#     missing copy is re-added instead, which is exactly the restore path).
+#     A config with NO servers at all never votes for removal: that is a
+#     fresh or app-reset profile, not a deliberate mass-delete (on Windows,
+#     2026-07-23, one blank profile config made the watcher remove every
+#     server from all ten profiles),
 #   - definitions differ -> the one from the newest-mtime config wins and
 #     overwrites the rest (tie: the default root, listed first, wins),
 #   - name missing from a config -> added there.
@@ -189,22 +204,25 @@ MCP_SYNC_JS='function run(argv) {
     var ln = lt.split("\n");
     for (var i = 0; i < ln.length; i++) { if (ln[i]) ledger[ln[i]] = 1; }
   }
-  var chosen = {}, chosenMt = {}, order = [], pcount = {};
+  var chosen = {}, chosenMt = {}, order = [], pcount = {}, voters = 0;
   for (var i = 0; i < files.length; i++) {
     var m = cfgs[i].mcpServers || {};
+    var any = false;
     for (var k in m) {
+      any = true;
       pcount[k] = (pcount[k] || 0) + 1;
       if (!(k in chosen)) { chosen[k] = m[k]; chosenMt[k] = mts[i]; order.push(k); }
       else if (mts[i] > chosenMt[k] && JSON.stringify(m[k]) !== JSON.stringify(chosen[k])) {
         chosen[k] = m[k]; chosenMt[k] = mts[i];
       }
     }
+    if (any) voters++;
   }
   var removed = {};
   if (deletes) {
     for (var q = 0; q < order.length; q++) {
       var k = order[q];
-      if (ledger[k] && pcount[k] < files.length) removed[k] = 1;
+      if (ledger[k] && pcount[k] < voters) removed[k] = 1;
     }
   }
   var out = [];
@@ -383,35 +401,77 @@ sync_profiles() {
 # lands in _shared and appears everywhere instantly, and there is nothing
 # left to reconcile (the v2/v3 winner/ledger/deletion machinery is gone).
 # The self-heal step then recreates list entries the app lost: any
-# transcript in ~/.claude/projects with no matching entry in _shared gets
-# one generated from the transcript itself. Entries are never edited or
+# transcript in ~/.claude/projects with no matching entry gets one
+# generated from the transcript itself. Entries are never edited or
 # deleted; transcripts are only ever read.
+#
+# v4.1 ports the lessons of the Windows v4 migration (the same design
+# shipped there first and hit real data bugs within days):
+#   - an app-created entry is named after the app's OWN session id and
+#     carries the transcript id inside as cliSessionId, so "already
+#     listed" must match BOTH, or every app-saved chat gets healed into a
+#     duplicate (674 of 715 entries on this machine have differing ids);
+#   - heal-ledger.tsv remembers every id ever listed, so an entry the
+#     user deleted in the app is never resurrected from its transcript;
+#     ids from the old v3 ledger.tsv seed it (an id there with no entry
+#     now was deleted post-sync);
+#   - transcripts are healed only when they are real conversations: UUID
+#     filename, not a sidechain, and a usable title (custom title, first
+#     user message, or summary);
+#   - a config entry can be pretty-printed by the app ("isArchived": x),
+#     so every field read tolerates both serializations;
+#   - absorbing an org folder ORs the archived flag across copies (v3
+#     semantics: archived-in-one means archived), verifies every file
+#     landed in _shared before the folder is removed, leaves any folder
+#     with unexpected content real (reported, never forced), and a hard
+#     failure mid-restructure auto-restores the whole tree from this
+#     run's backup.
+# The Windows archive-replay subsystem (tailing the app's main.log) is
+# deliberately NOT ported: it works around an MSIX packaging bug where
+# the app logs archive clicks but never persists the flag. On macOS the
+# flag demonstrably persists (verified 2026-07-23 across four profiles:
+# the newest logged archive event and the entry on disk agree). If a
+# macOS build ever ships the same bug, port Invoke-ArchiveReplay from
+# claude-sync.ps1.
 #
 # Intermediate state lives in $WORK_DIR (a mktemp dir, removed on exit):
 #   real_orgs.tsv   account<TAB>orgPath   (org dirs still needing absorb)
-#   have_ids.txt    cliSessionIds that already have a list entry
+#   listed_ids.txt  ids already listed (file names + cliSessionId values)
+#   seen_ids.txt    heal-ledger ids + v3-ledger ids (tombstones)
 #   heal_list.txt   transcript paths needing a regenerated entry
 # Paths contain spaces ("Application Support") but never tabs or newlines,
 # so TSV is a safe interchange format as long as every expansion is quoted.
 
 claude_desktop_running() {
-  # The restructure moves the app's live data dirs, so it may only run
+  # Structural work moves the app's live data dirs, so it may only run
   # while Claude Desktop is fully closed. A test tree (env override) is
-  # invisible to the real app, so the guard does not apply there.
-  [ -n "${CLAUDE_SYNC_SESSIONS_DIR:-}" ] && return 1
+  # invisible to the real app, so the guard does not apply there; an
+  # override pointed AT the real tree does not disable the guard.
+  if [ -n "${CLAUDE_SYNC_SESSIONS_DIR:-}" ]; then
+    [ "$SESSIONS_DIR" != "$HOME/Library/Application Support/Claude/claude-code-sessions" ] && return 1
+  fi
   pgrep -x "Claude" > /dev/null 2>&1
 }
 
-session_ts() {
-  # lastActivityAt of one list file (0 if absent). The JSON is a compact
-  # single line with no trailing newline, so RS is a byte that never
-  # appears in the file: one file, exactly one awk record.
+session_meta() {
+  # "lastActivityAt<TAB>isArchived(0/1)" of one list file. Entries come in
+  # two serializations: the compact one most files carry and the
+  # pretty-printed one ("isArchived": false) the app writes when it
+  # re-persists an entry, so both reads tolerate optional whitespace. The
+  # JSON is a single line with no trailing newline, so RS is a byte that
+  # never appears in the file: one file, exactly one awk record.
   awk 'BEGIN { RS = "\3" }
-    { if (match($0, /"lastActivityAt":[0-9]+/))
-        print substr($0, RSTART + 17, RLENGTH - 17) + 0
-      else
-        print 0
-      exit }' "$1"
+    {
+      ts = 0
+      if (match($0, /"lastActivityAt"[ \t]*:[ \t]*[0-9]+/)) {
+        t = substr($0, RSTART, RLENGTH)
+        sub(/^"lastActivityAt"[ \t]*:[ \t]*/, "", t)
+        ts = t + 0
+      }
+      arch = ($0 ~ /"isArchived"[ \t]*:[ \t]*true/) ? 1 : 0
+      print ts "\t" arch
+      exit
+    }' "$1"
 }
 
 find_real_orgs() {
@@ -440,13 +500,30 @@ backup_sessions_tree() {
   printf 'tree\t%s\t%s\n' "$SESSIONS_DIR" "$RUN_DIR/claude-code-sessions" >> "$MANIFEST"
 }
 
+org_has_strays() {
+  # Anything in the org dir that is not a regular local_*.json file (and
+  # not Finder junk) means we do not understand this folder; it stays a
+  # real dir and is reported, never forced (Windows v4 semantics).
+  for f in "$1"/* "$1"/.[!.]*; do
+    { [ -e "$f" ] || [ -L "$f" ]; } || continue
+    b="${f##*/}"
+    case "$b" in
+      local_*.json) [ -f "$f" ] && [ ! -L "$f" ] || return 0 ;;
+      .DS_Store|.localized) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 absorb_org_dir() {
   # $1 = account name, $2 = org dir path. Move every list file into
-  # _shared (name collision: the copy with the newer lastActivityAt wins;
-  # the loser is dropped, the tree backup keeps it), park anything
-  # unexpected in the run's backup dir, then swap the emptied dir for a
-  # relative symlink. Any failure leaves the dir real; the next run
-  # retries.
+  # _shared; on a name collision the copy with the newer lastActivityAt
+  # wins and the archived flag is OR-ed across copies (v3 semantics:
+  # archived-in-one means archived; the tree backup keeps every loser).
+  # Before the emptied dir is swapped for a relative symlink, every file
+  # must verifiably exist in _shared; any failure returns 1 and the
+  # caller aborts the whole restructure and restores the tree.
   acct_name="$1"
   org_path="$2"
   org_name=$(basename "$org_path")
@@ -454,29 +531,51 @@ absorb_org_dir() {
   for f in "$org_path"/local_*.json; do
     [ -f "$f" ] || continue
     fname=$(basename "$f")
-    if [ -f "$SHARED_DIR/$fname" ]; then
+    dst="$SHARED_DIR/$fname"
+    if [ -f "$dst" ]; then
       # v3 synced copies are usually byte-identical: cmp short-circuits
       # the common case so we don't fork awk twice per collision (~10k
       # files on a long-lived tree).
-      if cmp -s "$f" "$SHARED_DIR/$fname"; then
-        rm -f "$f"
-      else
-        if [ "$(session_ts "$f")" -gt "$(session_ts "$SHARED_DIR/$fname")" ]; then
-          cp -p "$f" "$SHARED_DIR/$fname"
+      if ! cmp -s "$f" "$dst"; then
+        IFS=$'\t' read -r o_ts o_arch <<EOF_M
+$(session_meta "$f")
+EOF_M
+        IFS=$'\t' read -r s_ts s_arch <<EOF_M
+$(session_meta "$dst")
+EOF_M
+        # OR of the ORIGINAL flags, decided before either copy can be
+        # overwritten: archived-in-one means archived (v3 semantics).
+        or_arch=0
+        { [ "$o_arch" = "1" ] || [ "$s_arch" = "1" ]; } && or_arch=1
+        if [ "$o_ts" -gt "$s_ts" ]; then
+          cp -p "$f" "$dst"
+          n_conflicts=$((n_conflicts + 1))
         fi
-        rm -f "$f"
+        if [ "$or_arch" = "1" ]; then
+          if [ "$(session_meta "$dst" | cut -f2)" = "0" ]; then
+            # Flip in place, tolerant of both serializations; command
+            # substitution strips the trailing newline sed adds, keeping
+            # the app's exact no-trailing-newline format; keep the mtime.
+            flip_tmp="$WORK_DIR/.flip.$$"
+            printf '%s' "$(sed 's/\("isArchived"[ \t]*:[ \t]*\)false/\1true/' "$dst")" > "$flip_tmp"
+            touch -r "$dst" "$flip_tmp"
+            mv "$flip_tmp" "$dst"
+            n_archflips=$((n_archflips + 1))
+          fi
+        fi
       fi
+      rm -f "$f"
     else
-      mv "$f" "$SHARED_DIR/$fname"
+      mv "$f" "$dst"
     fi
     absorbed=$((absorbed + 1))
   done
-  # Unexpected leftovers (a .DS_Store, anything else) are parked in the
-  # run's backup dir, never deleted.
+  rm -f "$org_path/.DS_Store" "$org_path/.localized"
+  # Belt and suspenders: nothing may be lost by the removal.
   for f in "$org_path"/* "$org_path"/.[!.]*; do
     { [ -e "$f" ] || [ -L "$f" ]; } || continue
-    mkdir -p "$RUN_DIR/leftovers/$acct_name/$org_name"
-    mv "$f" "$RUN_DIR/leftovers/$acct_name/$org_name/" || return 1
+    log "  ${YELLOW}entry was not absorbed into _shared: $f${RESET}"
+    return 1
   done
   rmdir "$org_path" || return 1
   # The link lives at <sessions>/<acct>/<org>, so it resolves relative to
@@ -486,13 +585,38 @@ absorb_org_dir() {
   log "  $acct_name/$org_name: absorbed $absorbed file(s), now a symlink to _shared"
 }
 
+restore_tree_from_run_backup() {
+  # Emergency path for a failure mid-restructure: put the pre-run tree
+  # back exactly as it was, from THIS run's backup.
+  [ -d "$RUN_DIR/claude-code-sessions" ] || return 1
+  rm -rf "$SESSIONS_DIR"
+  cp -RP "$RUN_DIR/claude-code-sessions" "$SESSIONS_DIR"
+}
+
 unify_sessions() {
   # One-time restructure, and the absorber for any fresh real folder the
   # app creates later. Idempotent: an already-linked tree has no real org
-  # dirs and this is a no-op.
+  # dirs and this is a no-op. Returns 0 (done or nothing to do),
+  # 1 (hard failure, tree restored), 2 (postponed: Claude is running;
+  # self-heal still runs, the restructure waits for a closed app).
   mode="$1"
   find_real_orgs
   [ -s "$WORK_DIR/real_orgs.tsv" ] || return 0
+
+  # Folders holding anything unexpected are left real and reported.
+  : > "$WORK_DIR/absorb_orgs.tsv"
+  while IFS=$'\t' read -r acct_name org_path; do
+    if org_has_strays "$org_path"; then
+      if [ "$mode" = "dry" ]; then
+        echo "  ${DIM}would leave REAL (unexpected content):${RESET} $org_path"
+      else
+        log "  ${YELLOW}left REAL, unexpected content: $org_path${RESET}"
+      fi
+    else
+      printf '%s\t%s\n' "$acct_name" "$org_path" >> "$WORK_DIR/absorb_orgs.tsv"
+    fi
+  done < "$WORK_DIR/real_orgs.tsv"
+  [ -s "$WORK_DIR/absorb_orgs.tsv" ] || return 0
 
   if [ "$mode" = "dry" ]; then
     while IFS=$'\t' read -r acct_name org_path; do
@@ -501,15 +625,14 @@ unify_sessions() {
         [ -f "$f" ] && n=$((n + 1))
       done
       echo "  ${DIM}would absorb${RESET} $acct_name/$(basename "$org_path") ($n file(s)) ${DIM}into _shared and replace it with a symlink${RESET}"
-    done < "$WORK_DIR/real_orgs.tsv"
+    done < "$WORK_DIR/absorb_orgs.tsv"
     return 0
   fi
 
   if claude_desktop_running; then
-    log "Claude Desktop is running. The session-list restructure moves its"
-    log "live folders, so quit Claude Desktop completely (Cmd+Q, all"
-    log "profiles) and run claude-sync again. Nothing was changed."
-    return 1
+    log "Claude Desktop is running: the session-list restructure is postponed"
+    log "until it is fully closed (Cmd+Q, all profiles). Self-heal still runs."
+    return 2
   fi
 
   if ! backup_sessions_tree; then
@@ -518,23 +641,100 @@ unify_sessions() {
   fi
   mkdir -p "$SHARED_DIR"
   log "Unifying session lists into _shared..."
+  n_conflicts=0
+  n_archflips=0
   while IFS=$'\t' read -r acct_name org_path; do
     if ! absorb_org_dir "$acct_name" "$org_path"; then
-      log "  ${YELLOW}could not fully absorb $org_path; left as a real dir (next run retries)${RESET}"
+      log "${YELLOW}RESTRUCTURE FAILED at $org_path. Restoring the pre-run tree from this run's backup...${RESET}"
+      if restore_tree_from_run_backup; then
+        log "Restored. The sessions tree is back to its pre-run state."
+      else
+        log "${YELLOW}AUTOMATIC RESTORE FAILED. Restore manually from: $RUN_DIR/claude-code-sessions${RESET}"
+      fi
+      return 1
     fi
-  done < "$WORK_DIR/real_orgs.tsv"
+  done < "$WORK_DIR/absorb_orgs.tsv"
+  log "Unified: $(count_shared_entries) session entries in _shared ($n_conflicts diverging copies resolved by newest activity, $n_archflips archive flags propagated)."
+
+  # Seed the heal ledger: every id visible now, plus every id the old v3
+  # ledger ever saw fully synced. An id whose entry is absent from the
+  # union but present in the v3 ledger was deleted by the user after its
+  # last full sync; seeding it keeps self-heal from resurrecting it out
+  # of its transcript.
+  {
+    for f in "$SHARED_DIR"/local_*.json; do
+      [ -f "$f" ] || continue
+      b="${f##*/}"; b="${b%.json}"
+      printf '%s\n' "${b#local_}"
+    done
+    # v3 ids persist as tombstones from day one, exactly like Windows.
+    read_tombstones "$WORK_DIR/.v3seed.txt"
+    cat "$WORK_DIR/.v3seed.txt"
+  } > "$WORK_DIR/seed_ids.txt"
+  save_heal_ledger "$WORK_DIR/seed_ids.txt"
   return 0
+}
+
+# ---------- heal ledger (tombstones) ---------------------------------------
+read_tombstones() {
+  # Union of the heal ledger and the old v3 session ledger into $1, one
+  # lowercase id per line. An id here whose entry is gone was deleted by
+  # the user in the app; without this file every deletion would be
+  # resurrected from its transcript on the next run. Merging the v3 ids
+  # at read time (not only at unify time) keeps dry and real runs agreeing.
+  {
+    [ -f "$HEAL_LEDGER" ] && cat "$HEAL_LEDGER"
+    if [ -f "$V3_LEDGER" ]; then
+      awk -F'\t' '$1 ~ /^local_[0-9a-fA-F-]+\.json$/ {
+        id = substr($1, 7, length($1) - 11)
+        if (length(id) == 36) print id
+      }' "$V3_LEDGER"
+    fi
+  } | tr 'A-F' 'a-f' | awk 'length($0) == 36' | sort -u > "$1"
+}
+
+save_heal_ledger() {
+  # $1 = file of ids to merge in. Atomic (temp + mv), backed into the run
+  # manifest, and skipped entirely when nothing changed so idle runs stay
+  # write-free.
+  merged="$WORK_DIR/.ledger_merged.$$"
+  {
+    [ -f "$HEAL_LEDGER" ] && cat "$HEAL_LEDGER"
+    cat "$1"
+  } | tr 'A-F' 'a-f' | awk 'length($0) == 36' | sort -u > "$merged"
+  if [ -f "$HEAL_LEDGER" ] && cmp -s "$merged" "$HEAL_LEDGER"; then
+    rm -f "$merged"
+    return 0
+  fi
+  ensure_run_dir
+  if [ -f "$HEAL_LEDGER" ]; then
+    if [ ! -f "$RUN_DIR/heal-ledger.tsv.pre" ]; then
+      cp -p "$HEAL_LEDGER" "$RUN_DIR/heal-ledger.tsv.pre"
+      printf 'overwrote\t%s\t%s\n' "$HEAL_LEDGER" "$RUN_DIR/heal-ledger.tsv.pre" >> "$MANIFEST"
+    fi
+  else
+    printf 'created\t%s\n' "$HEAL_LEDGER" >> "$MANIFEST"
+  fi
+  mkdir -p "$CANONICAL_DIR"
+  ledger_tmp="$CANONICAL_DIR/.heal-ledger.tmp.$$"
+  cp "$merged" "$ledger_tmp"
+  mv "$ledger_tmp" "$HEAL_LEDGER"
+  rm -f "$merged"
 }
 
 # Self-heal runs in osascript's JS runtime (no deps), one invocation per
 # sync. argv: [0] "plan"|"write"  [1] _shared dir  [2] path of a file
-# listing one transcript path per line. Per transcript: cwd, createdAt and
-# the title come from the first ~200 lines (title = first real user
-# message, XML-ish command wrappers and "Caveat:" preambles skipped; model
-# from the first assistant message), lastActivityAt from the last lines.
-# "write" creates _shared/local_<id>.json compact, no trailing newline,
-# exactly like the app's own files, and refuses to overwrite an existing
-# entry. Output per transcript: "MK<TAB>fname<TAB>title" or
+# listing one transcript path per line. Per transcript, from the first
+# ~250 lines: cwd, createdAt, model, and the title (a recorded custom
+# title wins; else the first real user message, with command wrappers,
+# "Caveat:" preambles, interrupted-request markers and isMeta rows
+# skipped; else the recorded summary); from the tail chunk: the last
+# timestamp and any late custom-title rename. Sidechain transcripts and
+# transcripts with no usable title are skipped, mirroring the Windows
+# implementation. "write" creates _shared/local_<id>.json compact, no
+# trailing newline, exactly like the app's own files, stamps the file
+# mtime with lastActivityAt, and refuses to overwrite an existing entry.
+# Output per transcript: "MK<TAB>fname<TAB>title" or
 # "SKIP<TAB>id<TAB>reason".
 HEAL_JS='function run(argv) {
   ObjC.import("Foundation");
@@ -576,8 +776,23 @@ HEAL_JS='function run(argv) {
     var ts = decode(d.subdataWithRange($.NSMakeRange(size - TAIL, TAIL)), true);
     return { head: hs.split("\n"), tail: ts.split("\n") };
   }
+  function cleanTitle(t) {
+    t = String(t).replace(/\s+/g, " ").replace(/^ +| +$/g, "");
+    if (t.length > 60) t = t.slice(0, 60).replace(/ +$/, "");
+    return t;
+  }
+  function fileDates(p) {
+    var a = $.NSFileManager.defaultManager.attributesOfItemAtPathError($(p), $());
+    var r = { created: 0, modified: 0 };
+    if (a.isNil()) return r;
+    var c = a.objectForKey($.NSFileCreationDate), m = a.objectForKey($.NSFileModificationDate);
+    if (!c.isNil()) r.created = Math.round(c.timeIntervalSince1970 * 1000);
+    if (!m.isNil()) r.modified = Math.round(m.timeIntervalSince1970 * 1000);
+    return r;
+  }
   var mode = argv[0], shared = argv[1], listText = read(argv[2]);
   if (!listText) return "";
+  var home = ObjC.unwrap($.NSHomeDirectory());
   var paths = listText.split("\n");
   var out = [];
   for (var i = 0; i < paths.length; i++) {
@@ -586,22 +801,36 @@ HEAL_JS='function run(argv) {
     var base = p.split("/").pop();
     var id = base.replace(/\.jsonl$/, "");
     var ck = readChunks(p);
-    if (!ck) { out.push("SKIP\t" + id + "\tunreadable"); continue; }
+    if (!ck) { out.push("SKIP\t" + id + "\tunreadable or empty"); continue; }
     var lines = ck.head;
-    var cwd = "", model = "", title = "", created = 0, last = 0, sawUser = false;
-    var head = Math.min(lines.length, 200);
+    var cwd = "", model = "", title = "", titleSource = "auto", summaryTitle = "";
+    var created = 0, last = 0, sawUser = false, sawMessageEntry = false, sidechain = false;
+    var head = Math.min(lines.length, 250);
     for (var j = 0; j < head; j++) {
       if (!lines[j]) continue;
       var o;
       try { o = JSON.parse(lines[j]); } catch (e) { continue; }
+      if (o.type == "custom-title" && o.customTitle) {
+        var ct = cleanTitle(o.customTitle);
+        if (ct) { title = ct; titleSource = "custom"; }
+      }
+      if (!summaryTitle && o.type == "summary" && o.summary) summaryTitle = String(o.summary);
       if (!cwd && o.cwd) cwd = String(o.cwd);
       var ts = o.timestamp ? Date.parse(o.timestamp) : 0;
       if (ts > 0) {
         if (!created || ts < created) created = ts;
         if (ts > last) last = ts;
       }
-      if (!model && o.message && o.message.model) model = String(o.message.model);
-      if (!title && o.type == "user" && o.message && o.message.content != null) {
+      if (!model && o.message && o.message.model && String(o.message.model).indexOf("claude-") == 0) {
+        model = String(o.message.model);
+      }
+      if (("parentUuid" in o) && !sawMessageEntry) {
+        // Only the file own first message entry decides sidechain-ness;
+        // quoted content later cannot.
+        sawMessageEntry = true;
+        if (o.isSidechain === true) { sidechain = true; break; }
+      }
+      if (!title && o.type == "user" && o.isMeta !== true && o.message && o.message.content != null) {
         sawUser = true;
         var c = o.message.content, txt = "";
         if (typeof c == "string") txt = c;
@@ -610,33 +839,51 @@ HEAL_JS='function run(argv) {
             if (c[q] && c[q].type == "text" && c[q].text) { txt = String(c[q].text); break; }
           }
         }
-        txt = txt.replace(/\s+/g, " ").replace(/^ +| +$/g, "");
-        if (txt && txt.charAt(0) != "<" && txt.indexOf("Caveat:") != 0) {
-          title = txt.length > 60 ? txt.slice(0, 60) + "..." : txt;
-        }
+        txt = cleanTitle(txt);
+        var bad = (txt == "") || txt.indexOf("Caveat:") == 0 || txt.indexOf("<command-") == 0 ||
+                  txt.indexOf("<local-command") == 0 || txt.indexOf("[Request interrupted") == 0 ||
+                  txt.indexOf("<system") == 0;
+        if (!bad) title = txt;
       }
     }
-    if (!sawUser) { out.push("SKIP\t" + id + "\tno user message"); continue; }
+    if (sidechain) { out.push("SKIP\t" + id + "\tsidechain"); continue; }
     var tl = ck.tail;
-    for (var j = tl.length - 1; j >= 0 && j >= tl.length - 20; j--) {
+    for (var j = tl.length - 1; j >= 0; j--) {
       if (!tl[j]) continue;
       var o2;
       try { o2 = JSON.parse(tl[j]); } catch (e) { continue; }
       var ts2 = o2.timestamp ? Date.parse(o2.timestamp) : 0;
       if (ts2 > last) last = ts2;
-      if (ts2 > 0) break;
+      // A late rename lives near the end of the file; the newest one wins.
+      if (o2.type == "custom-title" && o2.customTitle && titleSource != "tailcustom") {
+        var ct2 = cleanTitle(o2.customTitle);
+        if (ct2) { title = ct2; titleSource = "tailcustom"; }
+      }
+      if (ts2 > 0 && titleSource != "auto") break;
+      if (ts2 > 0 && j < tl.length - 20) break;
     }
+    if (titleSource == "tailcustom") titleSource = "custom";
+    if (!title && summaryTitle) {
+      var st = cleanTitle(summaryTitle);
+      if (st) title = st;
+    }
+    if (!title) { out.push("SKIP\t" + id + "\tno usable title (no user message)"); continue; }
+    var fd = fileDates(p);
+    if (!created) created = fd.created;
+    if (!created) created = fd.modified;
+    if (!last) last = fd.modified;
     if (!created) { out.push("SKIP\t" + id + "\tno timestamps"); continue; }
-    if (!last) last = created;
-    if (!title) title = "Recovered: " + (cwd ? cwd.split("/").pop() : id.slice(0, 8));
+    if (last < created) last = created;
+    if (!cwd) cwd = home;
+    if (!model) model = "claude-opus-4-8";
     var entry = {
       sessionId: "local_" + id, cliSessionId: id,
       cwd: cwd, originCwd: cwd,
-      createdAt: created, lastActivityAt: last, lastFocusedAt: last,
-      isArchived: false, title: title, titleSource: "auto",
-      permissionMode: "default", enabledMcpTools: {}
+      lastFocusedAt: last, createdAt: created, lastActivityAt: last,
+      model: model, effort: "high",
+      isArchived: false, title: title, titleSource: titleSource,
+      permissionMode: "bypassPermissions", enabledMcpTools: {}
     };
-    if (model) entry.model = model;
     var dst = shared + "/local_" + id + ".json";
     if (mode == "write") {
       if ($.NSFileManager.defaultManager.fileExistsAtPath($(dst))) {
@@ -644,6 +891,9 @@ HEAL_JS='function run(argv) {
         continue;
       }
       write(dst, JSON.stringify(entry));
+      var attrs = $.NSDictionary.dictionaryWithObjectForKey(
+        $.NSDate.dateWithTimeIntervalSince1970(last / 1000), $("NSFileModificationDate"));
+      $.NSFileManager.defaultManager.setAttributesOfItemAtPathError(attrs, $(dst), $());
     }
     out.push("MK\tlocal_" + id + ".json\t" + title);
   }
@@ -652,80 +902,149 @@ HEAL_JS='function run(argv) {
 
 heal_missing_entries() {
   # Recreate lost list entries from transcripts. Read-only towards
-  # ~/.claude; additive-only towards _shared. Runs every pass.
+  # ~/.claude; additive-only towards _shared. Runs every pass, safe with
+  # Claude open (the app reads the list at launch).
   mode="$1"
   [ -d "$PROJECTS_DIR" ] || return 0
   if [ "$mode" != "dry" ] && [ ! -d "$SHARED_DIR" ]; then
     return 0
   fi
 
-  # ids that already have a list entry: in _shared, or (when previewing a
-  # not-yet-unified tree) in any real org dir. Parameter expansion, not
-  # basename: no fork per file (the tree can hold ~10k files).
-  {
-    for f in "$SHARED_DIR"/local_*.json "$SESSIONS_DIR"/*/*/local_*.json; do
-      [ -f "$f" ] || continue
-      b="${f##*/}"
-      b="${b%.json}"
-      printf '%s\n' "${b#local_}"
-    done
-  } > "$WORK_DIR/have_ids.txt"
-
-  : > "$WORK_DIR/want.tsv"
-  for tr in "$PROJECTS_DIR"/*/*.jsonl; do
-    [ -f "$tr" ] || continue
-    printf '%s\t%s\n' "$(basename "$tr" .jsonl)" "$tr" >> "$WORK_DIR/want.tsv"
+  # Ids that already have a list entry: entry FILE NAMES are not enough.
+  # An app-created entry is named after the app's own session id and
+  # carries the transcript id inside as cliSessionId; only the
+  # heal-generated shape has the two equal. One awk pass over every entry
+  # (xargs -0 batches around ARG_MAX) collects both. Pre-unify dry runs
+  # scan the org dirs too, so the preview matches what a real run would do.
+  : > "$WORK_DIR/entry_paths.nul"
+  for f in "$SHARED_DIR"/local_*.json "$SESSIONS_DIR"/*/*/local_*.json; do
+    [ -f "$f" ] || continue
+    printf '%s\0' "$f" >> "$WORK_DIR/entry_paths.nul"
   done
+  : > "$WORK_DIR/listed_raw.txt"
+  if [ -s "$WORK_DIR/entry_paths.nul" ]; then
+    xargs -0 awk '
+      BEGIN { RS = "\3" }
+      FNR == 1 {
+        n = split(FILENAME, comp, "/")
+        fname = comp[n]
+        if (fname ~ /^local_[0-9a-fA-F-]+\.json$/) {
+          id = substr(fname, 7, length(fname) - 11)
+          if (length(id) == 36) print id
+        }
+        if (match($0, /"cliSessionId"[ \t]*:[ \t]*"[0-9a-fA-F-]+"/)) {
+          s = substr($0, RSTART, RLENGTH)
+          sub(/^"cliSessionId"[ \t]*:[ \t]*"/, "", s)
+          sub(/"$/, "", s)
+          if (length(s) == 36) print s
+        }
+      }
+    ' < "$WORK_DIR/entry_paths.nul" >> "$WORK_DIR/listed_raw.txt"
+  fi
+  tr 'A-F' 'a-f' < "$WORK_DIR/listed_raw.txt" | sort -u > "$WORK_DIR/listed_ids.txt"
+
+  read_tombstones "$WORK_DIR/seen_ids.txt"
+
+  # Transcripts wanting an entry: UUID filenames only (agent scratch files
+  # and other tools' jsonl never qualify).
+  {
+    for tr in "$PROJECTS_DIR"/*/*.jsonl; do
+      [ -f "$tr" ] || continue
+      b="${tr##*/}"
+      printf '%s\t%s\n' "${b%.jsonl}" "$tr"
+    done
+  } > "$WORK_DIR/want.tsv"
   [ -s "$WORK_DIR/want.tsv" ] || return 0
 
-  awk -F'\t' -v HAVE="$WORK_DIR/have_ids.txt" '
-    BEGIN { while ((getline line < HAVE) > 0) have[line] = 1; close(HAVE) }
-    !($1 in have) { print $2 }
+  awk -F'\t' -v LISTED="$WORK_DIR/listed_ids.txt" -v SEEN="$WORK_DIR/seen_ids.txt" \
+      -v SKIPSEEN="$WORK_DIR/skip_seen.count" '
+    BEGIN {
+      while ((getline line < LISTED) > 0) listed[line] = 1
+      close(LISTED)
+      while ((getline line < SEEN) > 0) seen[line] = 1
+      close(SEEN)
+      nseen = 0
+    }
+    {
+      id = tolower($1)
+      if (id !~ /^[0-9a-f-]+$/ || length(id) != 36) next
+      if (id in listed) next
+      if (id in seen) { nseen++; next }
+      print $2
+    }
+    END { print nseen > SKIPSEEN }
   ' "$WORK_DIR/want.tsv" > "$WORK_DIR/heal_list.txt"
-  [ -s "$WORK_DIR/heal_list.txt" ] || return 0
-
-  jsmode="write"
-  [ "$mode" = "dry" ] && jsmode="plan"
-  heal_out=$("$OSASCRIPT" -l JavaScript -e "$HEAL_JS" "$jsmode" "$SHARED_DIR" "$WORK_DIR/heal_list.txt" 2>&1)
+  skip_seen=$(cat "$WORK_DIR/skip_seen.count" 2>/dev/null || echo 0)
 
   healed=0
-  while IFS=$'\t' read -r tag fname title; do
-    case "$tag" in
-      MK)
-        if [ "$mode" = "dry" ]; then
-          echo "  ${DIM}would recreate list entry${RESET} $fname (\"$title\")"
-        else
-          ensure_run_dir
-          printf 'created\t%s\n' "$SHARED_DIR/$fname" >> "$MANIFEST"
-          log "  recreated list entry $fname (\"$title\")"
-          healed=$((healed + 1))
-        fi
-        ;;
-      SKIP)
-        [ "$mode" = "dry" ] && echo "  ${DIM}skip transcript $fname: $title${RESET}"
-        ;;
-    esac
-  done <<EOF_HEAL
+  skipped=0
+  if [ -s "$WORK_DIR/heal_list.txt" ]; then
+    jsmode="write"
+    [ "$mode" = "dry" ] && jsmode="plan"
+    heal_out=$("$OSASCRIPT" -l JavaScript -e "$HEAL_JS" "$jsmode" "$SHARED_DIR" "$WORK_DIR/heal_list.txt" 2>&1)
+
+    while IFS=$'\t' read -r tag fname title; do
+      case "$tag" in
+        MK)
+          if [ "$mode" = "dry" ]; then
+            echo "  ${DIM}would recreate list entry${RESET} $fname (\"$title\")"
+          else
+            ensure_run_dir
+            printf 'created\t%s\n' "$SHARED_DIR/$fname" >> "$MANIFEST"
+            log "  generated from transcript: $fname (\"$title\")"
+            healed=$((healed + 1))
+          fi
+          ;;
+        SKIP)
+          skipped=$((skipped + 1))
+          [ "$mode" = "dry" ] && echo "  ${DIM}skip transcript $fname: $title${RESET}"
+          ;;
+      esac
+    done <<EOF_HEAL
 $heal_out
 EOF_HEAL
+  fi
+
+  if [ "$mode" = "dry" ]; then
+    [ "$skip_seen" -gt 0 ] && echo "  ${DIM}$skip_seen transcript(s) skipped: deleted in the app before (heal ledger), never resurrected${RESET}"
+    return 0
+  fi
+
+  # Every id listed right now becomes a tombstone: if the user later
+  # deletes its entry in the app, self-heal will never bring it back. The
+  # already-known tombstones (heal ledger + v3 ids) are re-saved with
+  # them, so the v3 seed persists in heal-ledger.tsv itself (Windows
+  # parity: Save-HealLedger writes the merged seen set back).
+  {
+    cat "$WORK_DIR/listed_ids.txt" "$WORK_DIR/seen_ids.txt"
+    if [ "$healed" -gt 0 ]; then
+      awk -F'\t' '$1 == "MK" { sub(/^local_/, "", $2); sub(/\.json$/, "", $2); print $2 }' <<EOF_IDS
+$heal_out
+EOF_IDS
+    fi
+  } > "$WORK_DIR/now_listed.txt"
+  save_heal_ledger "$WORK_DIR/now_listed.txt"
 
   if [ "$healed" -gt 0 ]; then
-    log "Self-heal: $healed lost session(s) restored to the list."
+    log "Self-heal: $healed lost session(s) restored to the list ($skip_seen deleted-before skipped, $skipped not healable)."
   fi
   return 0
 }
 
 sync_sessions() {
   # Orchestrates the session layer: unify (when needed), then self-heal.
+  # A postponed restructure (Claude running) does not block healing.
   mode="$1"
   collect_accounts
   if [ ${#accounts[@]} -eq 0 ]; then
     log "No account folders in $SESSIONS_DIR yet; nothing to unify."
     return 0
   fi
-  unify_sessions "$mode" || return 1
+  unify_sessions "$mode"
+  unify_rc=$?
+  [ "$unify_rc" = "1" ] && return 1
   heal_missing_entries "$mode"
-  if [ "$mode" != "dry" ] && [ -d "$SHARED_DIR" ]; then
+  if [ "$mode" != "dry" ] && [ -d "$SHARED_DIR" ] && [ "$unify_rc" = "0" ]; then
     log "Session list: $(count_shared_entries) entries in _shared, seen by all ${#accounts[@]} account(s)."
   fi
   return 0
@@ -902,26 +1221,45 @@ cmd_revert() {
 
 # ---------- watcher (hands-off mode) -------------------------------------
 cmd_watch() {
-  log "[watcher] Watcher started."
+  # Transcript-driven, mirroring the Windows watcher: a conversation
+  # exists the moment its .jsonl transcript does, so quit detection is
+  # gone entirely (a quitting app's final writes are themselves activity).
+  # Self-heal is additive and safe with the app open; the restructure part
+  # self-postpones while any instance runs. macOS has no FileSystemWatcher
+  # for bash, so activity is a cheap poll: ONE stat call over the projects
+  # dir and its project subdirs (a new/removed transcript bumps its
+  # directory's mtime; appends to a known transcript never matter, because
+  # entries are generated once and never edited). Trailing debounce: sync
+  # fires after QUIET seconds of silence, at most once per MININT seconds.
+  QUIET=8
+  MININT=45
+  TICK=3
+  log "[watcher] Watcher started (transcript events)."
+  last_sig=""
+  last_event=0
+  last_run=0
   while true; do
-    # Wait for the Claude Desktop main process to be running
-    while ! pgrep -x "Claude" > /dev/null 2>&1; do
-      sleep 5
-    done
-
-    pid=$(pgrep -x "Claude" | head -1)
-    log "[watcher] Claude detected (PID $pid). Waiting for quit..."
-
-    # Wait for the main process to exit
-    while kill -0 "$pid" 2>/dev/null; do
-      sleep 2
-    done
-
-    # Brief grace period for helpers to clean up
-    sleep 3
-
-    log "[watcher] Claude quit. Running sync..."
-    do_sync
+    sig=$(stat -f '%N %m' "$PROJECTS_DIR" "$PROJECTS_DIR"/*/ 2>/dev/null | cksum)
+    now=$(date +%s)
+    if [ "$sig" != "$last_sig" ]; then
+      last_sig="$sig"
+      last_event=$now
+      sleep "$TICK"
+      continue
+    fi
+    if [ "$last_event" -eq 0 ] ||
+       [ $((now - last_event)) -lt "$QUIET" ] ||
+       [ $((now - last_run)) -lt "$MININT" ]; then
+      sleep "$TICK"
+      continue
+    fi
+    log "[watcher] Transcript activity: running sync..."
+    # Fresh run state per iteration (one backup run dir per sync).
+    RUN_DIR=""
+    MANIFEST=""
+    do_sync || log "[watcher] sync ended with rc=$? (a postponed restructure logs its reason above)"
+    last_run=$(date +%s)
+    last_event=0
   done
 }
 
@@ -1070,6 +1408,9 @@ cmd_status() {
     [ -f "$tr" ] && n_tr=$((n_tr + 1))
   done
   echo "  transcripts on disk: $n_tr ${DIM}($PROJECTS_DIR)${RESET}"
+  if [ -f "$HEAL_LEDGER" ]; then
+    echo "  heal ledger: $(awk 'END { print NR }' "$HEAL_LEDGER") id(s) remembered ${DIM}(deleted entries stay deleted)${RESET}"
+  fi
   if [ -f "$CANONICAL_PATH" ]; then
     echo "Script: installed at $CANONICAL_PATH"
   else
@@ -1127,7 +1468,9 @@ Usage: claude-sync [command]
   --install          Copy this script to ~/.claude/scripts/ and register the
                      'claude-sync' alias in ~/.zshrc. Re-run to update.
   --uninstall        Remove the alias and the auto-sync agent (if enabled).
-  --auto-install     Auto-sync every time Claude Desktop quits (LaunchAgent).
+  --auto-install     Auto-sync whenever new conversations appear: a
+                     LaunchAgent watches ~/.claude/projects and syncs
+                     after 8s of write silence, at most once per 45s.
   --auto-uninstall   Disable auto-sync.
   --version          Print version.
   --help             This text.
