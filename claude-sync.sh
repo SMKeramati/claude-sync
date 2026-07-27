@@ -30,22 +30,33 @@
 #
 # It also syncs customization across PROFILES: multi-profile launchers
 # (claude-deck) give each profile its own data dir under
-# ~/Library/Application Support/Claude Profiles/<name>/, so local MCP
-# servers (the mcpServers block of claude_desktop_config.json) and installed
-# Desktop Extensions diverge per profile. Every sync reconciles mcpServers
-# across all data dirs: missing servers are added everywhere, and when two
-# profiles define the SAME server differently, the definition from the
-# config file with the newest mtime wins and overwrites the others (edit a
-# server in any profile, it propagates). Removing a server from any profile
-# removes it everywhere too, tracked by an MCP ledger so "deleted" is never
-# confused with "never had it"; --no-deletes skips (and thereby restores)
-# removals. Every other key of each config file is untouched. Extensions
-# stay copy-only (additive). Config writes are backed up into the run's
+# ~/Library/Application Support/Claude Profiles/<name>/, so both blocks of
+# claude_desktop_config.json that matter, mcpServers and preferences (the
+# app settings: bypassPermissions and friends), diverge per profile, as do
+# installed Desktop Extensions. Every sync reconciles both blocks across
+# all data dirs in one pass:
+#   - MCP servers: missing ones are added everywhere; when two profiles
+#     define the SAME server differently the newest-mtime config wins;
+#     a removal propagates only when some config is RECORDED IN THE LEDGER
+#     as having held that server, does not hold it now, and still holds
+#     others. The ledger is per config, which is what makes "the user
+#     deleted it here" distinguishable from "this profile never had it"
+#     (the v3 global ledger could not tell them apart, and one fresh
+#     profile therefore wiped every server on 2026-07-23 on Windows and
+#     2026-07-26 here). --no-deletes skips (and thereby restores) removals.
+#   - Settings (preferences): add-only. A key set in any profile spreads to
+#     all of them, newest change wins a conflict, *ByAccount maps merge
+#     entry by entry so no account's opt-in is dropped, per-profile window
+#     state (launchPreview*) is left alone, and nothing is ever deleted.
+# Every other key of each config file is untouched. Extensions stay
+# copy-only (additive). Config writes are backed up into the run's
 # manifest, so --revert undoes them too.
-# Logins, cookies, and UI preferences are deliberately never synced:
-# separate accounts are the whole point of profiles. Claude Code
-# customization (plugins, skills, hooks, memory in ~/.claude) is already
-# machine-global and needs no syncing. Session dirs inside profiles are
+# Deliberately never synced: logins and cookies (separate accounts are the
+# whole point of profiles), and config.json, which holds the profile's
+# oauth token cache and per-account app state next to a few UI keys.
+# Claude Code customization (plugins, skills, hooks, memory, settings.json
+# in ~/.claude) is already machine-global: every profile reads the same
+# files, so there is nothing to sync. Session dirs inside profiles are
 # claude-deck's job (it symlinks them to the shared one), not ours.
 #
 # Compatible with the stock macOS /bin/bash (3.2). No dependencies
@@ -53,7 +64,7 @@
 #
 # https://github.com/SMKeramati/claude-sync
 
-VERSION="4.1.0"
+VERSION="4.2.0"
 
 # Absolute path: /usr/local/bin may shadow osascript with a wrapper (seen in
 # the wild: a VPN toggle shim), and LaunchAgent PATH is minimal anyway.
@@ -74,11 +85,13 @@ CANONICAL_PATH="$CANONICAL_DIR/claude-sync.sh"
 LOG="$CANONICAL_DIR/claude-sync.log"
 BACKUPS_DIR="$CANONICAL_DIR/backups"
 BACKUP_KEEP=10
-# Profile layer ledger: the MCP server names that were present in EVERY
-# profile's config at the end of the last sync. A name in this ledger but
-# missing from some profile now = the user removed it there, so it is
-# removed everywhere. A name absent from the ledger = new, so it is added
-# everywhere. Without this file no MCP removal can ever propagate.
+# Profile layer ledger: "cfgPath<TAB>serverName" rows recording which MCP
+# servers EACH config held at the end of the last sync. A row that exists
+# while the config no longer holds that server = the user removed it there,
+# so it is removed everywhere. No row = that config never had it, so it is
+# added there. Without this file no MCP removal can ever propagate, which
+# is the safe direction. (A v3-era ledger of bare names has no per-config
+# information; it is ignored for removals and replaced on the first run.)
 MCP_LEDGER="$CANONICAL_DIR/mcp-ledger.tsv"
 # Heal ledger: every session id self-heal has ever seen listed (or
 # generated). An id here whose entry is gone was deleted by the user in
@@ -153,32 +166,66 @@ ensure_run_dir() {
   # session plan executor and the profile config sync, so --revert undoes
   # a whole run no matter which layer wrote. Created lazily on first write.
   [ -n "${RUN_DIR:-}" ] && return 0
-  RUN_DIR="$BACKUPS_DIR/$(date +%s)"
+  # Two syncs in the same second (a manual run racing the watcher) must
+  # never land in the same dir: the second one's ": > $MANIFEST" would
+  # truncate the first one's manifest and silently make its whole-tree
+  # restore unrevertable, backup files still on disk but unreachable.
+  # Names stay pure integers, so the numeric sort in prune_backups and the
+  # integer comparison in cmd_revert keep working.
+  stamp=$(date +%s)
+  while [ -e "$BACKUPS_DIR/$stamp" ]; do
+    stamp=$((stamp + 1))
+  done
+  RUN_DIR="$BACKUPS_DIR/$stamp"
   MANIFEST="$RUN_DIR/manifest.tsv"
   mkdir -p "$RUN_DIR"
   : > "$MANIFEST"
 }
 
 # One JS program, run twice per sync ("plan" narrates, "write" applies), so
-# both passes can never disagree on the decision logic. argv:
-#   [0] mode "plan"|"write"   [1] "deletes"|"nodeletes"   [2] MCP ledger path
-#   [3..] cfg-path, mtime pairs (default root's config always first).
-# Decisions, per server name across all configs:
-#   - name in the ledger but missing from >=1 config that HAS servers ->
-#     removed everywhere (only when deletes are on; with --no-deletes the
-#     missing copy is re-added instead, which is exactly the restore path).
-#     A config with NO servers at all never votes for removal: that is a
-#     fresh or app-reset profile, not a deliberate mass-delete (on Windows,
-#     2026-07-23, one blank profile config made the watcher remove every
-#     server from all ten profiles),
-#   - definitions differ -> the one from the newest-mtime config wins and
-#     overwrites the rest (tie: the default root, listed first, wins),
-#   - name missing from a config -> added there.
-# Output: "CHG<TAB>cfg<TAB>added<TAB>updated<TAB>removed" per touched file
-# (comma-joined names, "-" for an empty list: bash read squeezes consecutive
-# tabs, see the delete_rows comment), then "LEDGER<TAB>names" = the set every
-# config holds after the write, which bash persists as the next ledger.
-MCP_SYNC_JS='function run(argv) {
+# both passes can never disagree on the decision logic. It reconciles TWO
+# blocks of claude_desktop_config.json in a single pass (one read, one
+# backup, one write per file): mcpServers and preferences. Every other key
+# of every file is left byte-for-byte alone.
+#   argv: [0] "plan"|"write"  [1] "deletes"|"nodeletes"  [2] ledger path
+#         [3..] cfg-path, mtime pairs (default root's config always first).
+#
+# mcpServers, per server name across all configs:
+#   - definitions differ -> the newest-mtime config wins and overwrites the
+#     rest (tie: the default root, listed first, wins),
+#   - name missing from a config -> added there,
+#   - REMOVAL needs a witness: the name is removed everywhere only when some
+#     config C both (a) is recorded in the ledger as having held it, and
+#     (b) does not hold it now, and (c) still holds at least one other
+#     server. That is the only state that means "the user deleted it there".
+#     The ledger is therefore PER CONFIG (path<TAB>name rows), not one
+#     global set: a global set cannot tell "this profile never had it" from
+#     "this profile lost it", which is how a single fresh profile wiped
+#     every server on Windows (2026-07-23) and on this Mac (2026-07-26,
+#     nine servers across ten configs, v3 script). A profile that has never
+#     synced has no ledger rows and can never vote; a config the app reset
+#     to zero servers is excluded by (c). --no-deletes drops rule (c)-(a)
+#     entirely: nothing is removed and the missing copies are re-added,
+#     which is exactly the restore path.
+#
+# preferences (the app settings block: bypassPermissions and friends),
+# ADD-ONLY on purpose, so a profile that was never opened can never blank a
+# setting for the rest:
+#   - a key present in any config is propagated to all of them,
+#   - genuine conflict -> newest-mtime config wins ("my last change wins"),
+#   - *ByAccount maps merge entry by entry, newest mtime per account: the
+#     flags are keyed by account UUID, so copying the block verbatim would
+#     drop other accounts opt-ins and leave the setting inert in the
+#     profile whose own account was missing,
+#   - per-profile window state (launchPreview*) is never touched,
+#   - nothing is ever deleted from preferences.
+#
+# Output, tab-separated, "-" for an empty list (bash read squeezes
+# consecutive tabs, see the delete_rows comment):
+#   CHG<TAB>cfg<TAB>mcpAdded<TAB>mcpUpdated<TAB>mcpRemoved<TAB>prefsSet
+#   VOTE<TAB>name<TAB>cfg          (witness that justified each removal)
+#   LEDGER<TAB>cfg<TAB>names       (post-write mcpServers set of that cfg)
+CONFIG_SYNC_JS='function run(argv) {
   ObjC.import("Foundation");
   function read(p) {
     var s = $.NSString.stringWithContentsOfFileEncodingError($(p), $.NSUTF8StringEncoding, $());
@@ -187,6 +234,22 @@ MCP_SYNC_JS='function run(argv) {
   function write(p, s) {
     $(s).writeToFileAtomicallyEncodingError($(p), true, $.NSUTF8StringEncoding, $());
   }
+  // Key order must not count as a difference, or two configs holding the
+  // same setting written in a different order would overwrite each other
+  // forever.
+  function canon(v) {
+    if (v === null || typeof v != "object") return JSON.stringify(v);
+    if (Array.isArray(v)) {
+      var a = [];
+      for (var i = 0; i < v.length; i++) a.push(canon(v[i]));
+      return "[" + a.join(",") + "]";
+    }
+    var ks = Object.keys(v).sort(), o = [];
+    for (var i = 0; i < ks.length; i++) o.push(JSON.stringify(ks[i]) + ":" + canon(v[ks[i]]));
+    return "{" + o.join(",") + "}";
+  }
+  var PREFS_NO_SYNC = { launchPreviewPersistedWorkspaces: 1, launchPreviewSessionScopedSessions: 1 };
+
   var mode = argv[0], deletes = (argv[1] == "deletes"), ledgerPath = argv[2];
   var files = [], mts = [], cfgs = [];
   for (var i = 3; i < argv.length; i += 2) {
@@ -195,66 +258,133 @@ MCP_SYNC_JS='function run(argv) {
   }
   for (var i = 0; i < files.length; i++) {
     var t = read(files[i]), j;
-    try { j = t ? JSON.parse(t) : {}; }
+    try { j = (t && t.replace(/\s/g, "") !== "") ? JSON.parse(t) : {}; }
     catch (e) { return "ERR not valid JSON, profile sync skipped: " + files[i]; }
     cfgs.push(j);
   }
+
+  // Ledger: path -> {name:1}. Rows are "path<TAB>name". A v3-era ledger
+  // (bare names, no tab) carries no per-config knowledge, so it is ignored
+  // for voting and simply replaced by the new format after this run: the
+  // first run under the new rule can only ADD, never remove.
   var ledger = {}, lt = read(ledgerPath);
   if (lt) {
     var ln = lt.split("\n");
-    for (var i = 0; i < ln.length; i++) { if (ln[i]) ledger[ln[i]] = 1; }
+    for (var i = 0; i < ln.length; i++) {
+      if (!ln[i]) continue;
+      var tab = ln[i].indexOf("\t");
+      if (tab < 1) continue;
+      var lp = ln[i].slice(0, tab), lname = ln[i].slice(tab + 1);
+      if (!lname) continue;
+      if (!(lp in ledger)) ledger[lp] = {};
+      ledger[lp][lname] = 1;
+    }
   }
-  var chosen = {}, chosenMt = {}, order = [], pcount = {}, voters = 0;
+
+  // --- mcpServers: winner per name, and the removal witnesses -------------
+  var chosen = {}, chosenMt = {}, order = [], now = [];
   for (var i = 0; i < files.length; i++) {
-    var m = cfgs[i].mcpServers || {};
-    var any = false;
+    var m = (cfgs[i] && cfgs[i].mcpServers) || {};
+    var mine = {}, count = 0;
     for (var k in m) {
-      any = true;
-      pcount[k] = (pcount[k] || 0) + 1;
+      mine[k] = 1; count++;
       if (!(k in chosen)) { chosen[k] = m[k]; chosenMt[k] = mts[i]; order.push(k); }
-      else if (mts[i] > chosenMt[k] && JSON.stringify(m[k]) !== JSON.stringify(chosen[k])) {
+      else if (mts[i] > chosenMt[k] && canon(m[k]) !== canon(chosen[k])) {
         chosen[k] = m[k]; chosenMt[k] = mts[i];
       }
     }
-    if (any) voters++;
+    now.push({ set: mine, count: count });
   }
-  var removed = {};
+  var removed = {}, votes = [];
   if (deletes) {
     for (var q = 0; q < order.length; q++) {
       var k = order[q];
-      if (ledger[k] && pcount[k] < voters) removed[k] = 1;
+      for (var i = 0; i < files.length; i++) {
+        if (now[i].count === 0) continue;                 // fresh or app-reset
+        if (k in now[i].set) continue;                    // still there
+        if (!(files[i] in ledger) || !ledger[files[i]][k]) continue;  // never had it
+        removed[k] = 1;
+        votes.push("VOTE\t" + k + "\t" + files[i]);
+        break;
+      }
     }
   }
-  var out = [];
+
+  // --- preferences: winner per key, *ByAccount merged entry by entry -----
+  var pChosen = {}, pChosenMt = {}, pOrder = [], acctVal = {}, acctMt = {};
   for (var i = 0; i < files.length; i++) {
-    var m = cfgs[i].mcpServers || {}, add = [], upd = [], del = [];
+    var p = (cfgs[i] && cfgs[i].preferences) || {};
+    if (typeof p != "object" || p === null || Array.isArray(p)) continue;
+    for (var k in p) {
+      if (k in PREFS_NO_SYNC) continue;
+      if (k.length > 9 && k.slice(-9) == "ByAccount" &&
+          p[k] !== null && typeof p[k] == "object" && !Array.isArray(p[k])) {
+        if (!(k in acctVal)) { acctVal[k] = {}; acctMt[k] = {}; pOrder.push(k); }
+        for (var a in p[k]) {
+          if (!(a in acctVal[k]) || mts[i] > acctMt[k][a]) {
+            acctVal[k][a] = p[k][a]; acctMt[k][a] = mts[i];
+          }
+        }
+        continue;
+      }
+      if (!(k in pChosen)) { pChosen[k] = p[k]; pChosenMt[k] = mts[i]; pOrder.push(k); }
+      else if (mts[i] > pChosenMt[k] && canon(p[k]) !== canon(pChosen[k])) {
+        pChosen[k] = p[k]; pChosenMt[k] = mts[i];
+      }
+    }
+  }
+  for (var k in acctVal) {
+    var merged = {}, aks = Object.keys(acctVal[k]).sort();
+    for (var i = 0; i < aks.length; i++) merged[aks[i]] = acctVal[k][aks[i]];
+    pChosen[k] = merged;
+  }
+
+  // --- per-config plan, then one write per changed file ------------------
+  var out = [];
+  for (var v = 0; v < votes.length; v++) out.push(votes[v]);
+  for (var i = 0; i < files.length; i++) {
+    var m = (cfgs[i] && cfgs[i].mcpServers) || {};
+    var add = [], upd = [], del = [], pset = [];
     for (var q = 0; q < order.length; q++) {
       var k = order[q];
       if (removed[k]) { if (k in m) { del.push(k); delete m[k]; } continue; }
       if (!(k in m)) { add.push(k); m[k] = chosen[k]; }
-      else if (JSON.stringify(m[k]) !== JSON.stringify(chosen[k])) { upd.push(k); m[k] = chosen[k]; }
+      else if (canon(m[k]) !== canon(chosen[k])) { upd.push(k); m[k] = chosen[k]; }
     }
-    if (add.length || upd.length || del.length) {
+    var p = cfgs[i].preferences;
+    var pIsObj = (p !== null && typeof p == "object" && !Array.isArray(p));
+    var pWork = pIsObj ? p : {};
+    for (var q = 0; q < pOrder.length; q++) {
+      var k = pOrder[q];
+      if (!(k in pWork) || canon(pWork[k]) !== canon(pChosen[k])) {
+        pset.push(k);
+        pWork[k] = pChosen[k];
+      }
+    }
+    if (add.length || upd.length || del.length || pset.length) {
       if (mode == "write") {
-        cfgs[i].mcpServers = m;
+        if (order.length || Object.keys(m).length) cfgs[i].mcpServers = m;
+        if (pOrder.length) cfgs[i].preferences = pWork;
         write(files[i], JSON.stringify(cfgs[i], null, 2) + "\n");
       }
-      out.push("CHG\t" + files[i] + "\t" + (add.join(",") || "-") + "\t" + (upd.join(",") || "-") + "\t" + (del.join(",") || "-"));
+      out.push("CHG\t" + files[i] + "\t" + (add.join(",") || "-") + "\t" +
+               (upd.join(",") || "-") + "\t" + (del.join(",") || "-") + "\t" +
+               (pset.join(",") || "-"));
     }
+    // Post-write mcpServers set of THIS config, for the next run ledger.
+    var have = Object.keys((mode == "write") ? m : m).sort();
+    out.push("LEDGER\t" + files[i] + "\t" + (have.join(",") || "-"));
   }
-  var fin = [];
-  for (var q = 0; q < order.length; q++) { if (!removed[order[q]]) fin.push(order[q]); }
-  out.push("LEDGER\t" + (fin.join(",") || "-"));
   return out.join("\n");
 }'
 
-sync_mcp_servers() {
-  # Reconcile the mcpServers block of claude_desktop_config.json across
-  # every root; every other key of each file is preserved. $1 = "dry"
-  # narrates the plan and writes nothing; $2 = "deletes"/"nodeletes".
-  # Real writes back the previous file into the run manifest as an
-  # overwrite, so --revert restores it (removals included). JSON runs in
-  # osascript's JS runtime: no deps.
+sync_configs() {
+  # Reconcile the mcpServers and preferences blocks of
+  # claude_desktop_config.json across every root; every other key of every
+  # file is preserved. $1 = "dry" narrates the plan and writes nothing;
+  # $2 = "deletes"/"nodeletes". Real writes back the previous file into the
+  # run manifest as an overwrite, so --revert restores it (removals
+  # included). JSON runs in osascript's JS runtime: no deps.
   mode="$1"
   deletes="$2"
   [ ${#roots[@]} -lt 2 ] && return 0
@@ -272,25 +402,33 @@ sync_mcp_servers() {
   done
   [ "$n_cfgs" -lt 2 ] && return 0
 
-  plan_out=$("$OSASCRIPT" -l JavaScript -e "$MCP_SYNC_JS" plan "$deletes" "$MCP_LEDGER" "${cfg_args[@]}" 2>&1)
+  plan_out=$("$OSASCRIPT" -l JavaScript -e "$CONFIG_SYNC_JS" plan "$deletes" "$MCP_LEDGER" "${cfg_args[@]}" 2>&1)
   case "$plan_out" in
-    ERR*) log "MCP servers: ${plan_out#ERR }"; return 0 ;;
+    ERR*) log "Profile config: ${plan_out#ERR }"; return 0 ;;
     "")   return 0 ;;
   esac
 
   # In dry mode just narrate the plan; otherwise back up every file the
   # write pass will touch, into this run's backup dir.
-  has_changes=""
-  while IFS=$'\t' read -r tag cfg add upd del; do
+  while IFS=$'\t' read -r tag cfg add upd del pset; do
     case "$tag" in
+      VOTE)
+        # $cfg = server name, $add = the config that lost it.
+        if [ "$mode" = "dry" ]; then
+          echo "  ${DIM}removal witness:${RESET} [$cfg] was in $add before and is gone there now"
+        else
+          log "  MCP removal witness: [$cfg] was recorded in $add and is gone there now"
+        fi
+        continue
+        ;;
       CHG) ;;
       *)   continue ;;
     esac
-    has_changes=1
     if [ "$mode" = "dry" ]; then
       [ "$add" != "-" ] && echo "  ${DIM}would add MCP server(s)${RESET} [$add] -> $cfg"
       [ "$upd" != "-" ] && echo "  ${DIM}would update MCP server(s)${RESET} [$upd] -> $cfg"
-      [ "$del" != "-" ] && echo "  ${DIM}would remove MCP server(s)${RESET} [$del] -> $cfg"
+      [ "$del" != "-" ] && echo "  ${YELLOW}would remove MCP server(s)${RESET} [$del] -> $cfg"
+      [ "$pset" != "-" ] && echo "  ${DIM}would sync setting(s)${RESET} [$pset] -> $cfg"
       continue
     fi
     ensure_run_dir
@@ -304,16 +442,23 @@ EOF_PLAN
     return 0
   fi
 
-  merge_out=$("$OSASCRIPT" -l JavaScript -e "$MCP_SYNC_JS" write "$deletes" "$MCP_LEDGER" "${cfg_args[@]}" 2>&1)
+  merge_out=$("$OSASCRIPT" -l JavaScript -e "$CONFIG_SYNC_JS" write "$deletes" "$MCP_LEDGER" "${cfg_args[@]}" 2>&1)
   case "$merge_out" in
-    ERR*) log "MCP servers: ${merge_out#ERR }"; return 0 ;;
+    ERR*) log "Profile config: ${merge_out#ERR }"; return 0 ;;
   esac
 
-  ledger_csv=""
-  while IFS=$'\t' read -r tag cfg add upd del; do
+  ledger_tmp="$CANONICAL_DIR/.mcp-ledger.tmp.$$"
+  mkdir -p "$CANONICAL_DIR"
+  : > "$ledger_tmp"
+  while IFS=$'\t' read -r tag cfg add upd del pset; do
     case "$tag" in
       LEDGER)
-        ledger_csv="$cfg"
+        # $cfg = config path, $add = comma-joined names it holds now.
+        if [ "$add" != "-" ]; then
+          echo "$add" | tr ',' '\n' | while IFS= read -r nm; do
+            [ -n "$nm" ] && printf '%s\t%s\n' "$cfg" "$nm" >> "$ledger_tmp"
+          done
+        fi
         continue
         ;;
       CHG) ;;
@@ -321,29 +466,21 @@ EOF_PLAN
     esac
     ensure_run_dir
     parts=""
-    [ "$add" != "-" ] && parts="added [$add]"
-    [ "$upd" != "-" ] && parts="$parts${parts:+, }updated [$upd]"
-    [ "$del" != "-" ] && parts="$parts${parts:+, }removed [$del]"
-    log "  MCP server(s) $parts -> $cfg"
+    [ "$add" != "-" ]  && parts="added MCP [$add]"
+    [ "$upd" != "-" ]  && parts="$parts${parts:+, }updated MCP [$upd]"
+    [ "$del" != "-" ]  && parts="$parts${parts:+, }removed MCP [$del]"
+    [ "$pset" != "-" ] && parts="$parts${parts:+, }synced setting(s) [$pset]"
+    log "  $parts -> $cfg"
     printf 'overwrote\t%s\t%s\n' "$cfg" "$RUN_DIR/configs/$(echo "$cfg" | tr '/' '_')" >> "$MANIFEST"
   done <<EOF_OUT
 $merge_out
 EOF_OUT
 
-  # Persist the post-write "present everywhere" set. Written atomically for
-  # the same crash-safety reason as the session ledger.
-  if [ -n "$ledger_csv" ]; then
-    mcp_tmp="$CANONICAL_DIR/.mcp-ledger.tmp.$$"
-    mkdir -p "$CANONICAL_DIR"
-    if [ "$ledger_csv" = "-" ]; then
-      : > "$mcp_tmp"
-    else
-      echo "$ledger_csv" | tr ',' '\n' > "$mcp_tmp"
-    fi
-    mv "$mcp_tmp" "$MCP_LEDGER"
-  fi
+  # Persist the per-config "holds these servers" ledger. Written atomically
+  # (temp + mv) so a crash mid-write never leaves a truncated ledger; a
+  # missing/empty ledger is a normal, safe starting state (no votes).
+  mv "$ledger_tmp" "$MCP_LEDGER"
 }
-
 sync_extensions() {
   # Copy installed Desktop Extensions across roots, additively. Best
   # effort: a Claude build that also tracks extensions in per-profile
@@ -389,7 +526,7 @@ sync_profiles() {
   deletes="$2"
   collect_roots
   [ ${#roots[@]} -lt 2 ] && return 0
-  sync_mcp_servers "$mode" "$deletes"
+  sync_configs "$mode" "$deletes"
   sync_extensions "$mode"
 }
 
@@ -1217,6 +1354,28 @@ cmd_revert() {
   mv "$latest" "$latest.reverted"
   log "Reverted: removed $removed created file(s), restored $restored overwritten file(s), restored $undeleted deleted file(s)."
   log "${DIM}Backup kept at $latest.reverted. Run --revert again to undo the previous run.${RESET}"
+
+  # Heal-only runs (the common case once the tree is unified) pile up newer
+  # than the restructure, so "undo the last run" is often not the run the
+  # user has in mind. Say how far away the structural one is.
+  if [ "$restored_tree" = "0" ]; then
+    steps=0
+    tree_run=""
+    tab=$(printf '\t')
+    # Run dirs are our own names: pure integers, no spaces, ".reverted"
+    # suffix once undone. Newest first.
+    for d in $(ls -1 "$BACKUPS_DIR" 2>/dev/null | grep -v '\.reverted$' | sort -rn); do
+      [ -f "$BACKUPS_DIR/$d/manifest.tsv" ] || continue
+      steps=$((steps + 1))
+      if grep -q "^tree$tab" "$BACKUPS_DIR/$d/manifest.tsv" 2>/dev/null; then
+        tree_run="$d"
+        break
+      fi
+    done
+    if [ -n "$tree_run" ]; then
+      log "${DIM}This run changed no folder structure. The last restructure is run $tree_run: $steps more --revert to undo it (Claude must be closed).${RESET}"
+    fi
+  fi
 }
 
 # ---------- watcher (hands-off mode) -------------------------------------
@@ -1369,12 +1528,15 @@ cmd_status() {
     echo "Data dirs: ${#roots[@]} (default + $(( ${#roots[@]} - 1 )) profile(s) in 'Claude Profiles')"
     for root in "${roots[@]}"; do
       cfg="$root/claude_desktop_config.json"
-      n=0
+      n="0 MCP server(s), 0 setting(s)"
       if [ -f "$cfg" ]; then
-        n=$("$OSASCRIPT" -l JavaScript -e 'function run(a){ObjC.import("Foundation");var s=$.NSString.stringWithContentsOfFileEncodingError($(a[0]),$.NSUTF8StringEncoding,$());if(s.isNil())return 0;try{return Object.keys(JSON.parse(ObjC.unwrap(s)).mcpServers||{}).length}catch(e){return "?"}}' "$cfg" 2>/dev/null)
+        n=$("$OSASCRIPT" -l JavaScript -e 'function run(a){ObjC.import("Foundation");var s=$.NSString.stringWithContentsOfFileEncodingError($(a[0]),$.NSUTF8StringEncoding,$());if(s.isNil())return "0 MCP server(s), 0 setting(s)";try{var j=JSON.parse(ObjC.unwrap(s));return Object.keys(j.mcpServers||{}).length+" MCP server(s), "+Object.keys(j.preferences||{}).length+" setting(s)"}catch(e){return "unreadable"}}' "$cfg" 2>/dev/null)
       fi
-      echo "  $(basename "$root"): $n MCP server(s)"
+      echo "  $(basename "$root"): $n"
     done
+    if [ -f "$MCP_LEDGER" ]; then
+      echo "  ${DIM}MCP ledger: $(awk 'END { print NR }' "$MCP_LEDGER") (config, server) row(s)${RESET}"
+    fi
   fi
   echo "Sessions dir: $SESSIONS_DIR"
   if [ ! -d "$SESSIONS_DIR" ]; then
@@ -1447,10 +1609,13 @@ _shared folder, so each conversation exists once and every account sees
 it. Each run also self-heals the list: a transcript in ~/.claude/projects
 with no list entry gets one regenerated (the app sometimes loses entries
 after restarts or rewound sessions). Existing entries are never edited or
-deleted; transcripts are never touched. Customization (MCP servers,
-Desktop Extensions) still syncs across profiles (claude-deck): a server
-edited in one profile propagates, newest config wins, removals propagate
-unless --no-deletes. Logins, cookies, and preferences are never touched.
+deleted; transcripts are never touched. Customization also syncs across
+profiles (claude-deck): MCP servers and app settings (the preferences
+block: bypassPermissions and friends) are reconciled in every run. A
+server or setting changed in one profile propagates, the newest change
+wins a conflict, settings are add-only, and an MCP removal propagates
+only when a config the ledger saw holding that server lost it (skip with
+--no-deletes). Logins, cookies and config.json are never touched.
 
 Usage: claude-sync [command]
 
@@ -1464,7 +1629,8 @@ Usage: claude-sync [command]
   --revert           Undo the most recent sync run from its backup. If that
                      run restructured the session tree, this restores the
                      whole tree exactly as it was (Claude must be closed).
-  --status           Show unify state, entry counts, install state.
+  --status           Show unify state, entry counts, per-profile MCP and
+                     settings counts, install state.
   --install          Copy this script to ~/.claude/scripts/ and register the
                      'claude-sync' alias in ~/.zshrc. Re-run to update.
   --uninstall        Remove the alias and the auto-sync agent (if enabled).
