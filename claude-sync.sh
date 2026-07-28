@@ -25,8 +25,13 @@
 #     entry file names AND each entry's inner cliSessionId AND the heal
 #     ledger of everything ever listed, so app-created entries are never
 #     duplicated and an entry deleted in the app is never resurrected.
-#     Existing entries are never edited or deleted; transcripts are only
-#     ever read.
+#     Entries are never edited, and the ONLY entry ever deleted is one
+#     self-heal wrote itself that the app has since replaced with its own
+#     copy of the same conversation (heal-made.tsv is the record of what we
+#     wrote; the app's copy always survives). Without that the chat shows
+#     up twice, and an archived one looks un-archived, because our copy
+#     carries isArchived false while the app's carries the real flag.
+#     Transcripts are only ever read.
 #
 # It also syncs customization across PROFILES: multi-profile launchers
 # (claude-deck) give each profile its own data dir under
@@ -38,12 +43,18 @@
 #   - MCP servers: missing ones are added everywhere; when two profiles
 #     define the SAME server differently the newest-mtime config wins;
 #     a removal propagates only when some config is RECORDED IN THE LEDGER
-#     as having held that server, does not hold it now, and still holds
-#     others. The ledger is per config, which is what makes "the user
-#     deleted it here" distinguishable from "this profile never had it"
-#     (the v3 global ledger could not tell them apart, and one fresh
-#     profile therefore wiped every server on 2026-07-23 on Windows and
-#     2026-07-26 here). --no-deletes skips (and thereby restores) removals.
+#     as having held that server, does not hold it now, still holds
+#     others, and lost only that one server this run. The ledger is per
+#     config, which is what makes "the user deleted it here"
+#     distinguishable from "this profile never had it" (the v3 global
+#     ledger could not tell them apart, and one fresh profile therefore
+#     wiped every server on 2026-07-23 on Windows and 2026-07-26 here).
+#     The one-at-a-time rule is what tells a deletion from a STALE
+#     WRITEBACK: a running Claude Desktop holds its config in memory from
+#     launch and rewrites the whole file later, silently dropping every
+#     server added since, which looks identical to a bulk delete (it wiped
+#     eight servers across eleven configs on 2026-07-27).
+#     --no-deletes skips (and thereby restores) removals.
 #   - Settings (preferences): add-only. A key set in any profile spreads to
 #     all of them, newest change wins a conflict, *ByAccount maps merge
 #     entry by entry so no account's opt-in is dropped, per-profile window
@@ -64,7 +75,7 @@
 #
 # https://github.com/SMKeramati/claude-sync
 
-VERSION="4.2.0"
+VERSION="4.3.0"
 
 # Absolute path: /usr/local/bin may shadow osascript with a wrapper (seen in
 # the wild: a VPN toggle shim), and LaunchAgent PATH is minimal anyway.
@@ -93,11 +104,27 @@ BACKUP_KEEP=10
 # is the safe direction. (A v3-era ledger of bare names has no per-config
 # information; it is ignored for removals and replaced on the first run.)
 MCP_LEDGER="$CANONICAL_DIR/mcp-ledger.tsv"
+# How many ledgered servers a single config must lose IN ONE RUN before that
+# loss is read as a stale Claude Desktop writeback instead of a deletion (see
+# the CONFIG_SYNC_JS header). 2 = "removals propagate one server at a time",
+# which is how they actually happen in the UI. Raise it only if you really do
+# delete servers in batches and are willing to trade the guard for it.
+MCP_RESET_MIN="${CLAUDE_SYNC_MCP_RESET_MIN:-2}"
 # Heal ledger: every session id self-heal has ever seen listed (or
 # generated). An id here whose entry is gone was deleted by the user in
 # the app; without this file every deletion would be resurrected from its
 # transcript on the next run.
 HEAL_LEDGER="$CANONICAL_DIR/heal-ledger.tsv"
+# "fname<TAB>cliSessionId" for every list entry SELF-HEAL ITSELF created.
+# The app names its entries after its own session id and keeps the
+# transcript id inside as cliSessionId; self-heal has to name its file after
+# the transcript id, because that is the only id it knows. So when the app
+# later decides to persist its own entry for a session we already healed
+# (seen after closing and reopening an account), the list holds two entries
+# for one conversation and shows the chat twice. This file is what makes the
+# cleanup safe: it is the record of files we wrote, so the dedupe pass can
+# drop OUR copy and keep the app's without ever guessing.
+HEAL_MADE="$CANONICAL_DIR/heal-made.tsv"
 # The retired v3 session ledger, read once (never written): its ids seed
 # the heal ledger, so anything deleted in the app before the v4 migration
 # stays deleted. .ledger-accounts.tsv stays obsolete and harmless.
@@ -188,25 +215,37 @@ ensure_run_dir() {
 # backup, one write per file): mcpServers and preferences. Every other key
 # of every file is left byte-for-byte alone.
 #   argv: [0] "plan"|"write"  [1] "deletes"|"nodeletes"  [2] ledger path
-#         [3..] cfg-path, mtime pairs (default root's config always first).
+#         [3] reset-min  [4..] cfg-path, mtime pairs (default root first).
 #
 # mcpServers, per server name across all configs:
 #   - definitions differ -> the newest-mtime config wins and overwrites the
 #     rest (tie: the default root, listed first, wins),
 #   - name missing from a config -> added there,
 #   - REMOVAL needs a witness: the name is removed everywhere only when some
-#     config C both (a) is recorded in the ledger as having held it, and
-#     (b) does not hold it now, and (c) still holds at least one other
-#     server. That is the only state that means "the user deleted it there".
+#     config C (a) is recorded in the ledger as having held it, (b) does
+#     not hold it now, (c) still holds at least one other server, and
+#     (d) is not STALE (below). That is the only state that means "the user
+#     deleted it there".
 #     The ledger is therefore PER CONFIG (path<TAB>name rows), not one
 #     global set: a global set cannot tell "this profile never had it" from
 #     "this profile lost it", which is how a single fresh profile wiped
 #     every server on Windows (2026-07-23) and on this Mac (2026-07-26,
 #     nine servers across ten configs, v3 script). A profile that has never
 #     synced has no ledger rows and can never vote; a config the app reset
-#     to zero servers is excluded by (c). --no-deletes drops rule (c)-(a)
+#     to zero servers is excluded by (c). --no-deletes drops rule (a)-(d)
 #     entirely: nothing is removed and the missing copies are re-added,
 #     which is exactly the restore path.
+#   - STALE (rule d, the 2026-07-27 fix): a config missing RESET_MIN or more
+#     of its ledgered servers AT ONCE did not lose them to a person. Servers
+#     are deleted one at a time through the UI; losing several in one run is
+#     the signature of a Claude Desktop instance that has been open since
+#     before those servers existed and has just rewritten the whole file
+#     from its stale in-memory copy. Such a config votes for nothing and
+#     wins no conflict in EITHER block (its contents are old by definition),
+#     while the ordinary union-add path puts every missing server back on
+#     the same run. Cost of the guard being wrong: a genuine bulk delete
+#     comes back and has to be repeated one server at a time. Cost of not
+#     having it: every server on the machine disappears from every account.
 #
 # preferences (the app settings block: bypassPermissions and friends),
 # ADD-ONLY on purpose, so a profile that was never opened can never blank a
@@ -224,6 +263,7 @@ ensure_run_dir() {
 # consecutive tabs, see the delete_rows comment):
 #   CHG<TAB>cfg<TAB>mcpAdded<TAB>mcpUpdated<TAB>mcpRemoved<TAB>prefsSet
 #   VOTE<TAB>name<TAB>cfg          (witness that justified each removal)
+#   STALE<TAB>cfg<TAB>names        (config ignored this run, names it lost)
 #   LEDGER<TAB>cfg<TAB>names       (post-write mcpServers set of that cfg)
 CONFIG_SYNC_JS='function run(argv) {
   ObjC.import("Foundation");
@@ -251,8 +291,10 @@ CONFIG_SYNC_JS='function run(argv) {
   var PREFS_NO_SYNC = { launchPreviewPersistedWorkspaces: 1, launchPreviewSessionScopedSessions: 1 };
 
   var mode = argv[0], deletes = (argv[1] == "deletes"), ledgerPath = argv[2];
+  var RESET_MIN = parseInt(argv[3], 10);
+  if (!(RESET_MIN > 0)) RESET_MIN = 2;
   var files = [], mts = [], cfgs = [];
-  for (var i = 3; i < argv.length; i += 2) {
+  for (var i = 4; i < argv.length; i += 2) {
     files.push(argv[i]);
     mts.push(parseInt(argv[i + 1], 10) || 0);
   }
@@ -281,19 +323,41 @@ CONFIG_SYNC_JS='function run(argv) {
     }
   }
 
+  // --- what each config holds now, and which ones are stale --------------
+  // A config missing RESET_MIN or more of its ledgered servers at once is a
+  // Claude Desktop writeback from a stale in-memory copy, not a person
+  // deleting servers one by one. It gets no vote and no say in conflicts.
+  var now = [], stale = [], staleRows = [];
+  for (var i = 0; i < files.length; i++) {
+    var m0 = (cfgs[i] && cfgs[i].mcpServers) || {};
+    var mine = {}, count = 0;
+    for (var k in m0) { mine[k] = 1; count++; }
+    var had = ledger[files[i]] || {}, lost = [];
+    for (var k in had) if (!(k in mine)) lost.push(k);
+    now.push({ set: mine, count: count });
+    stale.push(lost.length >= RESET_MIN);
+    if (lost.length >= RESET_MIN) {
+      staleRows.push("STALE\t" + files[i] + "\t" + lost.sort().join(","));
+    }
+  }
+  // Effective mtime for every conflict in this program. A stale file is
+  // newest on disk (the app just wrote it) but oldest in content, so its
+  // real mtime would make it win every conflict in both blocks. -1 loses to
+  // every real mtime while still letting a name or key that exists ONLY
+  // there propagate outward: this guard never subtracts, only refuses.
+  var emt = [];
+  for (var i = 0; i < files.length; i++) emt.push(stale[i] ? -1 : mts[i]);
+
   // --- mcpServers: winner per name, and the removal witnesses -------------
-  var chosen = {}, chosenMt = {}, order = [], now = [];
+  var chosen = {}, chosenMt = {}, order = [];
   for (var i = 0; i < files.length; i++) {
     var m = (cfgs[i] && cfgs[i].mcpServers) || {};
-    var mine = {}, count = 0;
     for (var k in m) {
-      mine[k] = 1; count++;
-      if (!(k in chosen)) { chosen[k] = m[k]; chosenMt[k] = mts[i]; order.push(k); }
-      else if (mts[i] > chosenMt[k] && canon(m[k]) !== canon(chosen[k])) {
-        chosen[k] = m[k]; chosenMt[k] = mts[i];
+      if (!(k in chosen)) { chosen[k] = m[k]; chosenMt[k] = emt[i]; order.push(k); }
+      else if (emt[i] > chosenMt[k] && canon(m[k]) !== canon(chosen[k])) {
+        chosen[k] = m[k]; chosenMt[k] = emt[i];
       }
     }
-    now.push({ set: mine, count: count });
   }
   var removed = {}, votes = [];
   if (deletes) {
@@ -301,6 +365,7 @@ CONFIG_SYNC_JS='function run(argv) {
       var k = order[q];
       for (var i = 0; i < files.length; i++) {
         if (now[i].count === 0) continue;                 // fresh or app-reset
+        if (stale[i]) continue;                           // stale writeback
         if (k in now[i].set) continue;                    // still there
         if (!(files[i] in ledger) || !ledger[files[i]][k]) continue;  // never had it
         removed[k] = 1;
@@ -321,15 +386,15 @@ CONFIG_SYNC_JS='function run(argv) {
           p[k] !== null && typeof p[k] == "object" && !Array.isArray(p[k])) {
         if (!(k in acctVal)) { acctVal[k] = {}; acctMt[k] = {}; pOrder.push(k); }
         for (var a in p[k]) {
-          if (!(a in acctVal[k]) || mts[i] > acctMt[k][a]) {
-            acctVal[k][a] = p[k][a]; acctMt[k][a] = mts[i];
+          if (!(a in acctVal[k]) || emt[i] > acctMt[k][a]) {
+            acctVal[k][a] = p[k][a]; acctMt[k][a] = emt[i];
           }
         }
         continue;
       }
-      if (!(k in pChosen)) { pChosen[k] = p[k]; pChosenMt[k] = mts[i]; pOrder.push(k); }
-      else if (mts[i] > pChosenMt[k] && canon(p[k]) !== canon(pChosen[k])) {
-        pChosen[k] = p[k]; pChosenMt[k] = mts[i];
+      if (!(k in pChosen)) { pChosen[k] = p[k]; pChosenMt[k] = emt[i]; pOrder.push(k); }
+      else if (emt[i] > pChosenMt[k] && canon(p[k]) !== canon(pChosen[k])) {
+        pChosen[k] = p[k]; pChosenMt[k] = emt[i];
       }
     }
   }
@@ -341,6 +406,7 @@ CONFIG_SYNC_JS='function run(argv) {
 
   // --- per-config plan, then one write per changed file ------------------
   var out = [];
+  for (var s = 0; s < staleRows.length; s++) out.push(staleRows[s]);
   for (var v = 0; v < votes.length; v++) out.push(votes[v]);
   for (var i = 0; i < files.length; i++) {
     var m = (cfgs[i] && cfgs[i].mcpServers) || {};
@@ -402,7 +468,7 @@ sync_configs() {
   done
   [ "$n_cfgs" -lt 2 ] && return 0
 
-  plan_out=$("$OSASCRIPT" -l JavaScript -e "$CONFIG_SYNC_JS" plan "$deletes" "$MCP_LEDGER" "${cfg_args[@]}" 2>&1)
+  plan_out=$("$OSASCRIPT" -l JavaScript -e "$CONFIG_SYNC_JS" plan "$deletes" "$MCP_LEDGER" "$MCP_RESET_MIN" "${cfg_args[@]}" 2>&1)
   case "$plan_out" in
     ERR*) log "Profile config: ${plan_out#ERR }"; return 0 ;;
     "")   return 0 ;;
@@ -412,6 +478,21 @@ sync_configs() {
   # write pass will touch, into this run's backup dir.
   while IFS=$'\t' read -r tag cfg add upd del pset; do
     case "$tag" in
+      STALE)
+        # $cfg = config path, $add = the servers it lost in one go. Loud on
+        # purpose: this is the exact shape of the bug that wiped every
+        # server on 2026-07-27, and the user should know their app instance
+        # is running on an out-of-date config.
+        if [ "$mode" = "dry" ]; then
+          echo "  ${YELLOW}stale config ignored:${RESET} $cfg lost [$add] at once"
+          echo "  ${DIM}  -> treated as a Claude Desktop writeback, not a deletion; would be restored${RESET}"
+        else
+          log "  MCP reset ignored: $cfg lost [$add] at once, which is a stale"
+          log "  Claude Desktop writeback, not a deletion. Restoring them and"
+          log "  ignoring that config this run. Quit and reopen that profile."
+        fi
+        continue
+        ;;
       VOTE)
         # $cfg = server name, $add = the config that lost it.
         if [ "$mode" = "dry" ]; then
@@ -442,7 +523,7 @@ EOF_PLAN
     return 0
   fi
 
-  merge_out=$("$OSASCRIPT" -l JavaScript -e "$CONFIG_SYNC_JS" write "$deletes" "$MCP_LEDGER" "${cfg_args[@]}" 2>&1)
+  merge_out=$("$OSASCRIPT" -l JavaScript -e "$CONFIG_SYNC_JS" write "$deletes" "$MCP_LEDGER" "$MCP_RESET_MIN" "${cfg_args[@]}" 2>&1)
   case "$merge_out" in
     ERR*) log "Profile config: ${merge_out#ERR }"; return 0 ;;
   esac
@@ -1037,6 +1118,107 @@ HEAL_JS='function run(argv) {
   return out.join("\n");
 }'
 
+entry_cli_ids() {
+  # "cliSessionId<TAB>fname" for every entry in _shared, lowercased. Same
+  # two-serialization tolerance as session_meta.
+  : > "$1"
+  for f in "$SHARED_DIR"/local_*.json; do
+    [ -f "$f" ] || continue
+    awk 'BEGIN { RS = "\3" }
+      FNR == 1 {
+        n = split(FILENAME, comp, "/"); fname = comp[n]
+        if (match($0, /"cliSessionId"[ \t]*:[ \t]*"[0-9a-fA-F-]+"/)) {
+          s = substr($0, RSTART, RLENGTH)
+          sub(/^"cliSessionId"[ \t]*:[ \t]*"/, "", s); sub(/"$/, "", s)
+          if (length(s) == 36) print tolower(s) "\t" fname
+        }
+        exit
+      }' "$f" >> "$1"
+  done
+}
+
+seed_heal_made() {
+  # One-time migration for machines that healed entries before this file
+  # existed. The log records every entry self-heal ever wrote, so it is an
+  # exact source; each candidate is still confirmed against the file on disk
+  # (its name must BE its cliSessionId, which is only true of our writes)
+  # before it is trusted. Created even when empty, so this runs once.
+  [ -f "$HEAL_MADE" ] && return 0
+  mkdir -p "$CANONICAL_DIR"
+  : > "$HEAL_MADE"
+  [ -f "$LOG" ] && [ -d "$SHARED_DIR" ] || return 0
+  sed -n 's/.*generated from transcript: \(local_[0-9a-fA-F-]*\.json\).*/\1/p' "$LOG" |
+    sort -u |
+    while IFS= read -r fname; do
+      [ -f "$SHARED_DIR/$fname" ] || continue
+      id="${fname#local_}"; id="${id%.json}"
+      grep -qi "\"cliSessionId\"[ ]*:[ ]*\"$id\"" "$SHARED_DIR/$fname" || continue
+      printf '%s\t%s\n' "$fname" "$(echo "$id" | tr 'A-F' 'a-f')" >> "$HEAL_MADE"
+    done
+  n=$(wc -l < "$HEAL_MADE" | tr -d ' ')
+  [ "$n" -gt 0 ] && log "Heal record seeded from the log: $n entry(ies) self-heal created before."
+  return 0
+}
+
+dedupe_healed_entries() {
+  # Drop a self-heal entry once the app has written its OWN entry for the
+  # same conversation, which is what makes a chat appear twice (and an
+  # archived one look un-archived: our copy carries isArchived false while
+  # the app's carries the real flag). Only files recorded in $HEAL_MADE are
+  # ever removed, and only while a NON-ours entry for the same cliSessionId
+  # exists, so the app's copy is always the survivor and nothing we did not
+  # write is ever touched. Deletions go into the run manifest, so --revert
+  # puts them back.
+  mode="$1"
+  [ -d "$SHARED_DIR" ] || return 0
+  [ -s "$HEAL_MADE" ] || return 0
+
+  entry_cli_ids "$WORK_DIR/cli_ids.tsv"
+  [ -s "$WORK_DIR/cli_ids.tsv" ] || return 0
+
+  # ours[fname] from the record; then per cliSessionId count ours and theirs
+  # and print only our files from groups that also hold one of theirs.
+  awk -F'\t' -v MADE="$HEAL_MADE" '
+    BEGIN { while ((getline line < MADE) > 0) { split(line, c, "\t"); if (c[1] != "") ours[c[1]] = 1 } close(MADE) }
+    {
+      id = $1; fn = $2
+      n[id]++
+      if (fn in ours) { mineList[id] = mineList[id] fn "\n"; mine[id]++ } else theirs[id]++
+    }
+    END { for (id in n) if (mine[id] > 0 && theirs[id] > 0) printf "%s", mineList[id] }
+  ' "$WORK_DIR/cli_ids.tsv" > "$WORK_DIR/dupes.txt"
+  [ -s "$WORK_DIR/dupes.txt" ] || return 0
+
+  dropped=0
+  while IFS= read -r fname; do
+    [ -n "$fname" ] && [ -f "$SHARED_DIR/$fname" ] || continue
+    if [ "$mode" = "dry" ]; then
+      echo "  ${DIM}would drop duplicate list entry${RESET} $fname (the app now has its own)"
+      dropped=$((dropped + 1))
+      continue
+    fi
+    ensure_run_dir
+    mkdir -p "$RUN_DIR/entries"
+    cp -p "$SHARED_DIR/$fname" "$RUN_DIR/entries/$fname" || continue
+    rm -f "$SHARED_DIR/$fname" || continue
+    printf 'deleted\t%s\t%s\n' "$SHARED_DIR/$fname" "$RUN_DIR/entries/$fname" >> "$MANIFEST"
+    dropped=$((dropped + 1))
+  done < "$WORK_DIR/dupes.txt"
+
+  [ "$dropped" -eq 0 ] && return 0
+  if [ "$mode" = "dry" ]; then
+    echo "  ${DIM}$dropped duplicate(s) the app re-created itself${RESET}"
+    return 0
+  fi
+  # Forget the rows we just dropped: the app owns those sessions now, and
+  # the heal ledger already holds their ids so self-heal will not remake them.
+  awk -F'\t' -v D="$WORK_DIR/dupes.txt" '
+    BEGIN { while ((getline l < D) > 0) gone[l] = 1 } !($1 in gone)
+  ' "$HEAL_MADE" > "$HEAL_MADE.tmp.$$" && mv "$HEAL_MADE.tmp.$$" "$HEAL_MADE"
+  log "Duplicate cleanup: dropped $dropped self-heal entry(ies) the app has since re-created itself."
+  return 0
+}
+
 heal_missing_entries() {
   # Recreate lost list entries from transcripts. Read-only towards
   # ~/.claude; additive-only towards _shared. Runs every pass, safe with
@@ -1128,6 +1310,12 @@ heal_missing_entries() {
           else
             ensure_run_dir
             printf 'created\t%s\n' "$SHARED_DIR/$fname" >> "$MANIFEST"
+            # Record it as ours, so that if the app later writes its own
+            # entry for the same conversation the dedupe pass knows which
+            # of the two copies it is allowed to remove.
+            hid="${fname#local_}"; hid="${hid%.json}"
+            mkdir -p "$CANONICAL_DIR"
+            printf '%s\t%s\n' "$fname" "$(echo "$hid" | tr 'A-F' 'a-f')" >> "$HEAL_MADE"
             log "  generated from transcript: $fname (\"$title\")"
             healed=$((healed + 1))
           fi
@@ -1180,6 +1368,11 @@ sync_sessions() {
   unify_sessions "$mode"
   unify_rc=$?
   [ "$unify_rc" = "1" ] && return 1
+  # Dedupe first, so the "already listed" scan inside the heal sees the
+  # cleaned-up list. Both passes are id-based, so the order cannot loop:
+  # a session whose app entry survives is listed, so it is never re-healed.
+  seed_heal_made
+  dedupe_healed_entries "$mode"
   heal_missing_entries "$mode"
   if [ "$mode" != "dry" ] && [ -d "$SHARED_DIR" ] && [ "$unify_rc" = "0" ]; then
     log "Session list: $(count_shared_entries) entries in _shared, seen by all ${#accounts[@]} account(s)."
@@ -1190,14 +1383,27 @@ prune_backups() {
   # Keep the newest $BACKUP_KEEP runs. Run dirs are named by epoch (plus a
   # ".reverted" suffix after a revert), so a numeric sort of basenames
   # orders them by age; the names are ours and contain no spaces.
+  #
+  # Runs that touched a config are counted SEPARATELY, because they are the
+  # only ones worth reverting for an MCP or settings mistake and they are
+  # rare next to session-only runs. The watcher fires on every transcript
+  # write, so ten session runs can happen in an hour: on 2026-07-27 the one
+  # backup that could have undone the server wipe was pruned six hours
+  # later, before anyone noticed. Two independent windows fix that.
   [ -d "$BACKUPS_DIR" ] || return 0
-  old=$(
+  keep_newest() {
+    # $1 = "configs" to consider only config-touching runs, "" for the rest.
     for d in "$BACKUPS_DIR"/*/; do
-      [ -d "$d" ] && basename "$d"
+      [ -d "$d" ] || continue
+      if [ -d "$d/configs" ]; then
+        [ "$1" = "configs" ] && basename "$d"
+      else
+        [ "$1" = "configs" ] || basename "$d"
+      fi
     done | sort -n | awk -v keep="$BACKUP_KEEP" '
       { a[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print a[i] }'
-  )
-  for b in $old; do
+  }
+  for b in $(keep_newest configs) $(keep_newest); do
     rm -rf "$BACKUPS_DIR/$b"
   done
 }
@@ -1517,7 +1723,7 @@ cmd_uninstall() {
   ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
   echo "${GREEN}Removed.${RESET} Open a new terminal for it to take effect."
   echo "${DIM}To delete the script, log and backups too:${RESET}"
-  echo "${DIM}  rm -rf \"$CANONICAL_PATH\" \"$LOG\" \"$BACKUPS_DIR\"${RESET}"
+  echo "${DIM}  rm -rf \"$CANONICAL_PATH\" \"$LOG\" \"$BACKUPS_DIR\" \"$HEAL_LEDGER\" \"$HEAL_MADE\" \"$MCP_LEDGER\"${RESET}"
 }
 
 # ---------- status / help -------------------------------------------------
@@ -1572,6 +1778,9 @@ cmd_status() {
   echo "  transcripts on disk: $n_tr ${DIM}($PROJECTS_DIR)${RESET}"
   if [ -f "$HEAL_LEDGER" ]; then
     echo "  heal ledger: $(awk 'END { print NR }' "$HEAL_LEDGER") id(s) remembered ${DIM}(deleted entries stay deleted)${RESET}"
+  fi
+  if [ -f "$HEAL_MADE" ]; then
+    echo "  heal record: $(awk 'END { print NR }' "$HEAL_MADE") entry(ies) written by self-heal ${DIM}(dropped if the app writes its own)${RESET}"
   fi
   if [ -f "$CANONICAL_PATH" ]; then
     echo "Script: installed at $CANONICAL_PATH"
