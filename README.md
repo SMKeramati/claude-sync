@@ -2,7 +2,7 @@
 
 **See all your Claude Code sessions, no matter which Claude account you're logged into, and keep your local customization in sync across profiles.** Claude Desktop keeps a separate session index per account, so switching accounts makes your local session list look empty even though every transcript is still on disk. And if you run multiple profiles (for example with [claude-deck](https://github.com/smk-labs/claude-deck)), each profile has its own data dir, so a local MCP server you add in one profile does not exist in the others. `claude-sync` fixes both: install once with one command, then just run `claude-sync` (or let auto-sync do it for you).
 
-**macOS** (`claude-sync.sh`) and **Windows** (`claude-sync.ps1`), one script per platform, no dependencies. Both implement the v4 design: one shared physical session list (behind directory junctions on Windows, symlinks on macOS) plus a self-heal step that rebuilds lost list entries from their transcripts. The Windows script works on Windows PowerShell 5.1 and PowerShell 7+ and accepts both `-DryRun`-style switches and the macOS `--dry-run` spellings.
+**macOS** (`claude-sync.sh`) and **Windows** (`claude-sync.ps1`), one script per platform, no dependencies. Both are at v4.3 and follow the same rules: one shared physical session list (behind directory junctions on Windows, symlinks on macOS), a self-heal step that rebuilds lost list entries from their transcripts, and a profile layer whose MCP removals need a named witness. The Windows script works on Windows PowerShell 5.1 and PowerShell 7+ and accepts both `-DryRun`-style switches and the macOS `--dry-run` spellings.
 
 ---
 
@@ -59,11 +59,11 @@ If `~/Library/Application Support/Claude Profiles/` exists (Windows: `%APPDATA%\
 
 Deliberately **not** synced: logins and cookies (separate accounts are the whole point of profiles), and `config.json`, which holds the profile's oauth token cache and per-account app state next to a few UI keys. Claude Code customization (plugins, skills, hooks, memory, `settings.json` in `~/.claude`) is already machine-global: every profile reads the same files, so there is nothing to sync. Per-profile session dirs are claude-deck's job (it symlinks them to the shared one).
 
-> **Why the witness rule exists.** Until v4.2 the ledger was one global set of "servers present in every config", which cannot tell *"this profile never had it"* from *"this profile lost it"*. One fresh profile whose config held a single auto-registered server was therefore enough to delete every other server from every profile: it happened on Windows on 2026-07-23 (7 servers × 10 profiles) and on macOS on 2026-07-26 (9 servers × 10 configs, under the older script). The per-config ledger removes the ambiguity at the root, and every propagated removal now logs the config that justified it.
+> **Why the witness rule exists.** Until the per-config ledger (v4.2 on macOS, v4.3 on Windows) the ledger was one flat set of "servers present in every config", which cannot tell *"this profile never had it"* from *"this profile lost it"*. One fresh profile whose config held a single auto-registered server was therefore enough to delete every other server from every profile: it happened on Windows on 2026-07-23 (7 servers × 10 profiles) and on macOS on 2026-07-26 (9 servers × 10 configs, under the older script). The per-config ledger removes the ambiguity at the root, and every propagated removal now logs the config that justified it.
 >
 > **Why rule (d), the one-at-a-time rule, exists.** A running Claude Desktop reads its config at launch, keeps it in memory, and later rewrites the whole file. Everything added to that file since the app started is silently dropped by that rewrite, which on disk is indistinguishable from you deleting several servers at once. On 2026-07-27 a profile that had been open since before eight servers were added wrote its stale copy back, and v4.2 read it as eight deliberate deletions and honoured them across all eleven configs. Servers are deleted one at a time through the UI, so losing two or more in one run is the signature of a stale writeback, not of a person. Such a config now votes for nothing, wins no conflict in either block (its contents are old by definition), and is refilled from the others on the same run. Raise the threshold with `CLAUDE_SYNC_MCP_RESET_MIN` if you genuinely delete servers in batches.
 >
-> **This is also why a config can look "not synced".** The sync writes the file correctly, but a Claude Desktop that is already running will not reload it, and may overwrite it from memory. Quit that profile completely (Cmd+Q) and reopen it to pick up new MCP servers and settings.
+> **This is also why a config can look "not synced".** The sync writes the file correctly, but a Claude Desktop that is already running will not reload it, and may overwrite it from memory. Quit that profile completely (Cmd+Q on macOS, quit it from the tray on Windows) and reopen it to pick up new MCP servers and settings.
 
 ---
 
@@ -197,7 +197,7 @@ The other account has never created a Claude Code session on this machine, so it
 Quit Claude Desktop fully (not just the window) and reopen. The app reads the index at launch.
 
 **A session vanished from the list but the conversation exists.**
-macOS: run `claude-sync`. The self-heal step regenerates the missing entry from the transcript.
+Run `claude-sync`. The self-heal step regenerates the missing entry from the transcript.
 
 **I deleted something by mistake and it's gone everywhere.**
 That is v4 semantics: one physical list, so a delete is immediate and everywhere. `claude-sync --revert` undoes the last run's writes; an app-side delete of an old entry is not a sync write, so treat deletes in the app as real deletes. The transcript itself is never deleted; ask self-heal to bring the entry back by removing its id line from `~/.claude/scripts/heal-ledger.tsv`.
@@ -206,7 +206,7 @@ That is v4 semantics: one physical list, so a delete is immediate and everywhere
 That was the v3/v4.1 removal rule (fixed in v4.2 by the witness rule) and its remaining hole, a stale app writeback (fixed in v4.3 by the one-at-a-time rule). To recover: put the servers back in one config (`claude-sync --revert` if the run is still in the backups, otherwise a `claude_desktop_config.json.bak*` next to the live file), then run `claude-sync` once: with no ledger rows for the missing names, it only adds, and every profile is refilled.
 
 **I added an MCP server / changed a setting and this profile still doesn't have it.**
-Check the file itself first, not the app: `claude-sync --status` shows the per-profile server count. If the file has it and the app doesn't, the app is running on the copy it read at launch. Quit that profile completely (Cmd+Q) and reopen it. Until you do, that instance may also write its stale copy back over the file, which the log reports as `MCP reset ignored` and repairs on the next run.
+Check the file itself first, not the app: `claude-sync --status` shows the per-profile server and settings counts. If the file has it and the app doesn't, the app is running on the copy it read at launch. Quit that profile completely (Cmd+Q on macOS, quit it from the tray on Windows) and reopen it. Until you do, that instance may also write its stale copy back over the file, which the log reports as `MCP reset ignored` and repairs on the next run.
 
 **The same chat shows up twice, or an archived chat came back un-archived.**
 That is a self-heal entry the app has since duplicated with one of its own. `claude-sync` cleans it up on the next run (its copy goes, the app's stays) and logs `Duplicate cleanup`.

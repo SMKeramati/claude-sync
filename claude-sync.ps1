@@ -23,10 +23,15 @@
 #     restart or a rewound session), generates a minimal entry from the
 #     transcript itself (title from the first user message or the recorded
 #     custom title; cwd, timestamps and model read from the transcript).
-#     Existing entries are never edited or deleted; transcripts are never
-#     touched. A heal ledger (heal-ledger.tsv) remembers every session id
-#     ever listed, so an entry the user deletes in the app is never
-#     resurrected from its transcript.
+#     Existing entries are never edited; transcripts are never touched. A
+#     heal ledger (heal-ledger.tsv) remembers every session id ever listed,
+#     so an entry the user deletes in the app is never resurrected from its
+#     transcript. The ONLY entry ever deleted is one self-heal wrote itself
+#     that the app has since replaced with its own copy of the same
+#     conversation (heal-made.tsv is the record of what we wrote; the app's
+#     copy always survives). Without that the chat shows up twice, and an
+#     archived one looks un-archived, because our copy carries isArchived
+#     false while the app's carries the real flag.
 #   - NEWCOMERS: when the app later creates a fresh real <account>\<org>
 #     folder (first login of a new account/org), the next run with Claude
 #     closed absorbs its entries into _shared and junctions it too.
@@ -61,19 +66,37 @@
 # diverge per profile. Every sync reconciles mcpServers across all data
 # dirs: missing servers are added everywhere, and when two profiles define
 # the SAME server differently, the definition from the config file with the
-# newest mtime wins and overwrites the others (edit a server in any
-# profile, it propagates). Removing a server from any profile removes it
-# everywhere too, tracked by an MCP ledger so "deleted" is never confused
-# with "never had it"; -NoDeletes skips (and thereby restores) removals.
+# newest EFFECTIVE mtime wins and overwrites the others (edit a server in
+# any profile, it propagates). A REMOVAL needs a witness: the name goes
+# everywhere only when some config C (a) is recorded in mcp-ledger.tsv as
+# having held it, (b) does not hold it now, (c) still holds at least one
+# other server, and (d) did not lose several servers at once. The ledger is
+# PER CONFIG ("cfgPath<TAB>serverName" rows), which is what makes "the user
+# deleted it here" distinguishable from "this profile never had it": the
+# older flat ledger of bare names could not tell them apart, so one fresh
+# profile holding a single auto-registered server wiped every server from
+# every profile on 2026-07-23 (7 servers x 10 profiles here).
+# Rule (d) is what tells a deletion from a STALE WRITEBACK: a running
+# Claude Desktop holds its config in memory from launch and rewrites the
+# whole file later, silently dropping every server added since, which on
+# disk is indistinguishable from a bulk delete (it wiped eight servers
+# across eleven configs on macOS on 2026-07-27). Servers are deleted one at
+# a time through the UI, so a config losing CLAUDE_SYNC_MCP_RESET_MIN (2)
+# or more of its ledgered servers in ONE run votes for nothing and wins no
+# conflict in EITHER block (its contents are old by definition even though
+# its file mtime is the newest on disk), while the ordinary union-add path
+# refills it on the same run. -NoDeletes skips (and thereby restores) all
+# removals.
 # The app's own settings (the "preferences" block: bypass-permissions,
 # scheduled tasks, sidebar mode, ...) are reconciled the same way, but
 # ADD-ONLY: a key present anywhere is propagated everywhere, nothing is
-# ever removed, and on a conflict the newest-mtime config wins, so the
+# ever removed, and on a conflict the newest effective mtime wins, so the
 # last change you made is the one that spreads. The per-account maps
-# (*ByAccount) merge entry by entry, so turning a setting on for one
-# account never drops another account's entry. A profile that has never
-# been opened has no preferences of its own and therefore can never blank
-# a setting for the rest -- the failure mode the MCP ledger guards against.
+# (*ByAccount) merge entry by entry (also by effective mtime), so turning a
+# setting on for one account never drops another account's entry. A profile
+# that has never been opened has no preferences of its own and therefore
+# can never blank a setting for the rest -- the failure mode the MCP ledger
+# guards against.
 # Every other key of each config file is untouched. Extensions stay
 # copy-only (additive). Config writes are backed up into the run's
 # manifest, so -Revert undoes them too. (No claude-deck profiles on this
@@ -126,7 +149,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '4.1.0'
+$ScriptVersion = '4.3.0'
 
 # $env:APPDATA fallback keeps the script parseable on non-Windows for testing.
 $AppData = if ($env:APPDATA) { $env:APPDATA } else { Join-Path $HOME 'AppData\Roaming' }
@@ -167,14 +190,33 @@ $LogPath            = Join-Path $CanonicalDir 'claude-sync.log'
 $BackupsDir         = Join-Path $CanonicalDir 'backups'
 $LedgerPath         = Join-Path $CanonicalDir 'ledger.tsv'
 $LedgerAccountsPath = Join-Path $CanonicalDir '.ledger-accounts.tsv'
+# Profile layer ledger: "cfgPath<TAB>serverName" rows recording which MCP
+# servers EACH config held at the end of the last sync (see Read-McpLedger).
 $McpLedgerPath      = Join-Path $CanonicalDir 'mcp-ledger.tsv'
 $HealLedgerPath     = Join-Path $CanonicalDir 'heal-ledger.tsv'
+# "fileName<TAB>cliSessionId" for every list entry SELF-HEAL itself created,
+# so the duplicate cleanup can drop OUR copy and keep the app's without ever
+# guessing (see Remove-DuplicateHealedEntries).
+$HealMadePath       = Join-Path $CanonicalDir 'heal-made.tsv'
 $ArchiveIntentsPath = Join-Path $CanonicalDir 'archive-intents.tsv'
 $ArchiveOffsetsPath = Join-Path $CanonicalDir 'archive-log-offsets.tsv'
 $RcBegin            = '# >>> claude-sync shortcut >>>'
 $RcEnd              = '# <<< claude-sync shortcut <<<'
 $TaskName           = 'claude-sync-watcher'
 $KeepBackups        = 10
+
+# How many ledgered MCP servers ONE config must lose in ONE run before that
+# loss is read as a stale Claude Desktop writeback instead of a deliberate
+# deletion (see Get-ConfigStates). 2 = "removals happen one server at a
+# time", which is how they actually happen in the UI. Raise it only if you
+# really do delete servers in batches and are willing to trade the guard.
+$McpResetMin = 2
+if ($env:CLAUDE_SYNC_MCP_RESET_MIN) {
+    $parsedMin = 0
+    if ([int]::TryParse($env:CLAUDE_SYNC_MCP_RESET_MIN, [ref]$parsedMin) -and $parsedMin -gt 0) {
+        $McpResetMin = $parsedMin
+    }
+}
 
 # Backups for one run live in one dir with one manifest, shared by the
 # profile config sync and the session module, so -Revert undoes a whole
@@ -204,8 +246,11 @@ function Out-Sync {
 function Initialize-RunDir {
     if ($script:RunDir) { return }
     $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    # Two runs inside the same second must not share a dir: a merged
-    # manifest would make one -Revert undo both runs at once.
+    # Two syncs in the same second (a manual run racing the watcher) must
+    # never land in the same dir: their manifests would merge, so one -Revert
+    # would undo both runs at once and the first run's whole-tree backup
+    # would sit on disk unreachable. Names stay pure integers, so the numeric
+    # sorts in the prune and revert paths keep working.
     while (Test-Path -LiteralPath (Join-Path $BackupsDir "$epoch")) { $epoch++ }
     $script:RunDir = Join-Path $BackupsDir "$epoch"
     $script:ManifestPath = Join-Path $script:RunDir 'manifest.tsv'
@@ -279,37 +324,55 @@ function ConvertTo-CanonicalJson {
 }
 
 function Read-McpLedger {
-    # One synced-everywhere server name per line. A name here but missing
-    # from some profile now = the user removed it there, so it is removed
-    # everywhere. A name absent from here = new, so it is added everywhere.
-    # Without this file no MCP removal can ever propagate.
-    $names = @{}
-    if (-not (Test-Path -LiteralPath $McpLedgerPath)) { return $names }
+    # "cfgPath<TAB>serverName" rows recording which MCP servers EACH config
+    # held at the end of the last sync, returned as
+    # @{ cfgPath = @{ serverName = $true } }. A row that exists while the
+    # config no longer holds that server = the user removed it THERE, which
+    # is the only thing that may propagate a removal. No rows for a config =
+    # it never synced, so it can never vote. Without this file no MCP removal
+    # can ever propagate, which is the safe direction.
+    #
+    # A v4.1-era ledger (bare names, no tab) carries no per-config knowledge:
+    # its lines are ignored here and the whole file is rewritten in the new
+    # format after this run, so the first run under the new rule can only
+    # ADD, never remove.
+    $byCfg = @{}
+    if (-not (Test-Path -LiteralPath $McpLedgerPath)) { return $byCfg }
     foreach ($line in @(Get-Content -LiteralPath $McpLedgerPath -ErrorAction SilentlyContinue)) {
-        if ($line) { $names[$line] = $true }
+        if (-not $line) { continue }
+        $tab = $line.IndexOf("`t")
+        if ($tab -lt 1) { continue }
+        $cfgPath = $line.Substring(0, $tab)
+        $name    = $line.Substring($tab + 1)
+        if (-not $name) { continue }
+        if (-not $byCfg.ContainsKey($cfgPath)) { $byCfg[$cfgPath] = @{} }
+        $byCfg[$cfgPath][$name] = $true
     }
-    return $names
+    return $byCfg
 }
 
-function Sync-McpServers {
-    # Reconcile the mcpServers block of claude_desktop_config.json across
-    # every root; every other key of each file is preserved. Decisions, per
-    # server name across all configs:
-    #   - name in the ledger but missing from >=1 config -> removed
-    #     everywhere (only when deletes are on; with -NoDeletes the missing
-    #     copy is re-added instead, which is exactly the restore path),
-    #   - definitions differ -> the one from the newest-mtime config wins
-    #     and overwrites the rest (tie: the default root, listed first, wins),
-    #   - name missing from a config -> added there.
-    #   - a config with NO servers at all never votes for removal: that is a
-    #     fresh or app-reset profile, not a deliberate mass-delete. On
-    #     2026-07-23 a blank profile dir launched once made the watcher
-    #     remove every server from all ten profiles.
-    # The plan is computed once in memory and then applied, so narration and
-    # writes can never disagree on the decision logic.
-    param($Roots, [bool]$Deletes)
-
-    $cfgs = New-Object System.Collections.Generic.List[object]
+function Get-ConfigStates {
+    # One read of every profile's claude_desktop_config.json, shared by the
+    # mcpServers and the preferences pass so both judge the same snapshot,
+    # the same mtimes and the same staleness. (Reading twice would also let
+    # the first pass' own write reset every mtime under the second one.)
+    # Returns $null when a config is unparseable: the whole config layer is
+    # then skipped, exactly as before.
+    #
+    # STALE, the rule that makes rule (d) work: a config missing $McpResetMin
+    # or more of its LEDGERED servers AT ONCE did not lose them to a person.
+    # Servers are deleted one at a time through the UI; losing several in one
+    # run is the signature of a Claude Desktop instance that has been open
+    # since before those servers existed and has just rewritten the whole
+    # file from its stale in-memory copy. Such a config gets an EFFECTIVE
+    # mtime of -1: it votes for no removal and wins no conflict in either
+    # block, because its contents are old by definition even though its file
+    # mtime is the newest on disk (the app just wrote it). -1 still loses to
+    # nothing when a name or key exists ONLY there, so the guard never
+    # subtracts, it only refuses; the union-add path refills it on this run.
+    param($Roots)
+    $ledger = Read-McpLedger
+    $states = New-Object System.Collections.Generic.List[object]
     foreach ($root in $Roots) {
         $cfgPath = Join-Path $root 'claude_desktop_config.json'
         if (-not (Test-Path -LiteralPath $cfgPath)) {
@@ -320,49 +383,103 @@ function Sync-McpServers {
         if (-not $raw.Trim()) { $raw = '{}' }
         $json = $null
         try { $json = ConvertFrom-Json $raw } catch {
-            Out-Sync "MCP servers: not valid JSON, profile sync skipped: $cfgPath"
-            return
+            Out-Sync "Profile config: not valid JSON, profile sync skipped: $cfgPath"
+            return $null
         }
         $mt = [long]([DateTimeOffset](Get-Item -LiteralPath $cfgPath).LastWriteTimeUtc).ToUnixTimeSeconds()
-        $cfgs.Add(@{ Path = $cfgPath; Json = $json; Mt = $mt })
+        $set = @{}
+        $mProp = $json.PSObject.Properties['mcpServers']
+        if ($mProp -and $null -ne $mProp.Value) {
+            foreach ($prop in @($mProp.Value.PSObject.Properties)) { $set[$prop.Name] = $true }
+        }
+        $had = @{}
+        if ($ledger.ContainsKey($cfgPath)) { $had = $ledger[$cfgPath] }
+        $lost = New-Object System.Collections.Generic.List[string]
+        foreach ($name in @($had.Keys)) { if (-not $set.ContainsKey($name)) { $lost.Add($name) } }
+        $stale = ($lost.Count -ge $McpResetMin)
+        # McpCount, not Count: a hashtable key named Count would read like the
+        # hashtable's own entry count to anyone skimming this.
+        $states.Add(@{
+            Path     = $cfgPath
+            Json     = $json
+            Mt       = $mt
+            EffMt    = $(if ($stale) { [long]-1 } else { $mt })
+            Stale    = $stale
+            Lost     = @($lost | Sort-Object)
+            Set      = $set
+            McpCount = $set.Count
+            Had      = $had
+        })
     }
-    if ($cfgs.Count -lt 2) { return }
+    return ,$states
+}
 
-    $ledger = Read-McpLedger
+function Sync-McpServers {
+    # Reconcile the mcpServers block of claude_desktop_config.json across
+    # every root; every other key of each file is preserved. Decisions, per
+    # server name across all configs:
+    #   - definitions differ -> the one from the newest EFFECTIVE-mtime
+    #     config wins and overwrites the rest (tie: the default root, listed
+    #     first, wins),
+    #   - name missing from a config -> added there,
+    #   - REMOVAL needs a witness: the name is removed everywhere only when
+    #     some config C (a) is recorded in the ledger as having held it,
+    #     (b) does not hold it now, (c) still holds at least one other
+    #     server, and (d) is not STALE (see Get-ConfigStates). That is the
+    #     only state that means "the user deleted it there", and the config
+    #     that justified it is logged.
+    #     (a) is why the ledger is per config: a flat set of names cannot
+    #     tell "this profile never had it" from "this profile lost it", so
+    #     one fresh profile was enough to wipe every server everywhere
+    #     (2026-07-23). (c) excludes a config the app reset to zero servers.
+    #     (d) excludes a stale Claude Desktop writeback, which passes (a),
+    #     (b) and (c) cleanly and looks exactly like a bulk delete.
+    #     -NoDeletes drops (a)-(d) entirely: nothing is removed and the
+    #     missing copies are re-added, which is exactly the restore path.
+    # The plan is computed once in memory and then applied, so narration and
+    # writes can never disagree on the decision logic.
+    param($States, [bool]$Deletes)
 
-    # Union pass: pick a winning definition per server name.
+    if ($States.Count -lt 2) { return }
+
+    # Union pass: pick a winning definition per server name. Effective mtime
+    # throughout, so a stale config never wins a conflict with its old copy.
     $order    = New-Object System.Collections.Generic.List[string]
     $chosen   = @{}
     $chosenMt = @{}
-    $pcount   = @{}
-    $voters = 0
-    foreach ($cfg in $cfgs) {
+    foreach ($cfg in $States) {
         $mProp = $cfg.Json.PSObject.Properties['mcpServers']
         if (-not $mProp -or $null -eq $mProp.Value) { continue }
-        $props = @($mProp.Value.PSObject.Properties)
-        if ($props.Count -gt 0) { $voters++ }
-        foreach ($prop in $props) {
+        foreach ($prop in @($mProp.Value.PSObject.Properties)) {
             $k = $prop.Name
-            if ($pcount.ContainsKey($k)) { $pcount[$k]++ } else { $pcount[$k] = 1 }
             if (-not $chosen.ContainsKey($k)) {
-                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.Mt; $order.Add($k)
-            } elseif ($cfg.Mt -gt $chosenMt[$k] -and
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt; $order.Add($k)
+            } elseif ($cfg.EffMt -gt $chosenMt[$k] -and
                       (ConvertTo-CanonicalJson $prop.Value) -ne (ConvertTo-CanonicalJson $chosen[$k])) {
-                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.Mt
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt
             }
         }
     }
 
     $removed = @{}
+    $votes   = New-Object System.Collections.Generic.List[string]
     if ($Deletes) {
         foreach ($k in $order) {
-            if ($ledger.ContainsKey($k) -and $pcount[$k] -lt $voters) { $removed[$k] = 1 }
+            foreach ($cfg in $States) {
+                if ($cfg.McpCount -eq 0) { continue }           # (c) fresh or app-reset
+                if ($cfg.Stale) { continue }                    # (d) stale writeback
+                if ($cfg.Set.ContainsKey($k)) { continue }      # (b) still there
+                if (-not $cfg.Had.ContainsKey($k)) { continue } # (a) never had it
+                $removed[$k] = 1
+                $votes.Add(('  MCP removal witness: [{0}] was recorded in {1} and is gone there now' -f $k, $cfg.Path))
+                break
+            }
         }
     }
 
     # Per-config plan: what to add, update, remove.
     $plans = New-Object System.Collections.Generic.List[object]
-    foreach ($cfg in $cfgs) {
+    foreach ($cfg in $States) {
         $mProp = $cfg.Json.PSObject.Properties['mcpServers']
         $m = if ($mProp) { $mProp.Value } else { $null }
         $add = New-Object System.Collections.Generic.List[string]
@@ -381,11 +498,9 @@ function Sync-McpServers {
             $plans.Add(@{ Cfg = $cfg; Add = $add; Upd = $upd; Del = $del })
         }
     }
-    # No changes: nothing to write and (matching the macOS script) the MCP
-    # ledger is left as-is; it is refreshed by the runs that do write.
-    if ($plans.Count -eq 0) { return }
 
     if ($DryRun) {
+        foreach ($v in $votes) { Write-Host $v }
         foreach ($p in $plans) {
             if ($p.Add.Count) { Write-Host ('  would add MCP server(s) [{0}] -> {1}' -f ($p.Add -join ','), $p.Cfg.Path) }
             if ($p.Upd.Count) { Write-Host ('  would update MCP server(s) [{0}] -> {1}' -f ($p.Upd -join ','), $p.Cfg.Path) }
@@ -393,6 +508,8 @@ function Sync-McpServers {
         }
         return
     }
+
+    foreach ($v in $votes) { Write-Log $v }
 
     foreach ($p in $plans) {
         $cfg = $p.Cfg
@@ -425,14 +542,24 @@ function Sync-McpServers {
         Write-Log ('  MCP server(s) {0} -> {1}' -f ($parts -join ', '), $cfg.Path)
     }
 
-    # Persist the post-write "present everywhere" set, atomically (temp file
-    # then move) so a crash mid-write never leaves a truncated ledger.
+    # Persist the per-config "holds these servers" ledger for the next run,
+    # every run and not just the ones that wrote: an unchanged run is also
+    # what replaces a stale v4.1-format ledger with the new one. Every config
+    # ends this pass holding the same set (the union-add path adds every
+    # non-removed name everywhere), so one list feeds all the rows. Written
+    # atomically (temp file then move) so a crash mid-write never leaves a
+    # truncated ledger; a missing or empty ledger is a normal, safe starting
+    # state (no votes).
     New-Item -ItemType Directory -Force -Path $CanonicalDir | Out-Null
-    $tmp = "$McpLedgerPath.tmp.$PID"
     $fin = New-Object System.Collections.Generic.List[string]
     foreach ($k in $order) { if (-not $removed.ContainsKey($k)) { $fin.Add($k) } }
-    if ($fin.Count -eq 0) { [System.IO.File]::WriteAllText($tmp, '') }
-    else { [System.IO.File]::WriteAllText($tmp, (($fin -join "`n") + "`n")) }
+    $rows = New-Object System.Collections.Generic.List[string]
+    foreach ($cfg in $States) {
+        foreach ($k in $fin) { $rows.Add(("{0}`t{1}" -f $cfg.Path, $k)) }
+    }
+    $tmp = "$McpLedgerPath.tmp.$PID"
+    if ($rows.Count -eq 0) { [System.IO.File]::WriteAllText($tmp, '') }
+    else { [System.IO.File]::WriteAllText($tmp, (($rows -join "`n") + "`n")) }
     Move-Item -LiteralPath $tmp -Destination $McpLedgerPath -Force
 }
 
@@ -483,22 +610,14 @@ function Sync-Preferences {
     # Per-account maps (*ByAccount) merge entry by entry, so switching a
     # setting on for one account never drops another account's entry -- the
     # reason a profile could look "off" even when the flag was on elsewhere.
-    param($Roots)
+    # Every "newest wins" comparison here uses the EFFECTIVE mtime, this one
+    # included: a config a running app just rewrote from its stale memory is
+    # the newest file on disk and holds the OLDEST settings, so its real
+    # mtime would spread every value it still remembers back over all the
+    # others. It can still introduce a key that exists only there.
+    param($States)
 
-    $cfgs = New-Object System.Collections.Generic.List[object]
-    foreach ($root in $Roots) {
-        $cfgPath = Join-Path $root 'claude_desktop_config.json'
-        if (-not (Test-Path -LiteralPath $cfgPath)) { continue }
-        $raw = [System.IO.File]::ReadAllText($cfgPath)
-        if (-not $raw.Trim()) { $raw = '{}' }
-        $json = $null
-        try { $json = ConvertFrom-Json $raw } catch {
-            Out-Sync "Preferences: not valid JSON, preference sync skipped: $cfgPath"
-            return
-        }
-        $mt = [long]([DateTimeOffset](Get-Item -LiteralPath $cfgPath).LastWriteTimeUtc).ToUnixTimeSeconds()
-        $cfgs.Add(@{ Path = $cfgPath; Json = $json; Mt = $mt })
-    }
+    $cfgs = $States
     if ($cfgs.Count -lt 2) { return }
 
     # Winner per key. Plain keys: newest mtime wins. Per-account maps:
@@ -520,19 +639,19 @@ function Sync-Preferences {
                 }
                 if ($null -ne $prop.Value) {
                     foreach ($e in @($prop.Value.PSObject.Properties)) {
-                        if ((-not $acctVal[$k].ContainsKey($e.Name)) -or ($cfg.Mt -gt $acctMt[$k][$e.Name])) {
+                        if ((-not $acctVal[$k].ContainsKey($e.Name)) -or ($cfg.EffMt -gt $acctMt[$k][$e.Name])) {
                             $acctVal[$k][$e.Name] = $e.Value
-                            $acctMt[$k][$e.Name]  = $cfg.Mt
+                            $acctMt[$k][$e.Name]  = $cfg.EffMt
                         }
                     }
                 }
                 continue
             }
             if (-not $chosen.ContainsKey($k)) {
-                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.Mt; $order.Add($k)
-            } elseif ($cfg.Mt -gt $chosenMt[$k] -and
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt; $order.Add($k)
+            } elseif ($cfg.EffMt -gt $chosenMt[$k] -and
                       (ConvertTo-CanonicalJson $prop.Value) -ne (ConvertTo-CanonicalJson $chosen[$k])) {
-                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.Mt
+                $chosen[$k] = $prop.Value; $chosenMt[$k] = $cfg.EffMt
             }
         }
     }
@@ -606,8 +725,28 @@ function Sync-Profiles {
     param([bool]$Deletes)
     $roots = Get-DataRoots
     if ($roots.Count -lt 2) { return }
-    Sync-McpServers -Roots $roots -Deletes $Deletes
-    Sync-Preferences -Roots $roots
+    # One snapshot for both passes: they are separate here (macOS does both
+    # in a single program), so they must not disagree about which config is
+    # stale or how old each one is.
+    $states = Get-ConfigStates -Roots $roots
+    if ($null -ne $states -and $states.Count -ge 2) {
+        foreach ($st in $states) {
+            if (-not $st.Stale) { continue }
+            # Loud on purpose: this is the exact shape of the bug that wiped
+            # every server across every profile, and the user should know
+            # that app instance is running on an out-of-date config.
+            if ($DryRun) {
+                Write-Host ('  stale config ignored: {0} lost [{1}] at once' -f $st.Path, ($st.Lost -join ','))
+                Write-Host '    -> treated as a Claude Desktop writeback, not a deletion; would be restored'
+            } else {
+                Write-Log ('  MCP reset ignored: {0} lost [{1}] at once, which is a stale' -f $st.Path, ($st.Lost -join ','))
+                Write-Log '  Claude Desktop writeback, not a deletion. Restoring them and'
+                Write-Log '  ignoring that config this run. Quit and reopen that profile.'
+            }
+        }
+        Sync-McpServers -States $states -Deletes $Deletes
+        Sync-Preferences -States $states
+    }
     Sync-Extensions -Roots $roots
 }
 
@@ -1208,6 +1347,154 @@ function Save-HealLedger {
     Move-Item -LiteralPath $tmp -Destination $HealLedgerPath -Force
 }
 
+function Get-HealMade {
+    # File names of every list entry SELF-HEAL itself created, from
+    # heal-made.tsv ("fileName<TAB>cliSessionId" rows). Only a file recorded
+    # here may ever be deleted by the duplicate cleanup.
+    $made = @{}
+    if (-not (Test-Path -LiteralPath $HealMadePath)) { return $made }
+    foreach ($line in @(Get-Content -LiteralPath $HealMadePath -ErrorAction SilentlyContinue)) {
+        if (-not $line) { continue }
+        $name = ($line -split "`t")[0]
+        if ($name) { $made[$name] = $true }
+    }
+    return $made
+}
+
+function Add-HealMadeRow {
+    param([string]$FileName, [string]$CliSessionId)
+    New-Item -ItemType Directory -Force -Path $CanonicalDir | Out-Null
+    [System.IO.File]::AppendAllText($HealMadePath,
+        ("{0}`t{1}`n" -f $FileName, $CliSessionId.ToLowerInvariant()))
+}
+
+function Initialize-HealMade {
+    # One-time migration for machines that healed entries before this file
+    # existed. The log records every entry self-heal ever wrote, so it is an
+    # exact source; each candidate is still confirmed against the file on
+    # disk (its name must BE its cliSessionId, which is only ever true of our
+    # own writes) before it is trusted. Created even when empty, so this runs
+    # exactly once.
+    if (Test-Path -LiteralPath $HealMadePath) { return }
+    if ($DryRun) { return }
+    New-Item -ItemType Directory -Force -Path $CanonicalDir | Out-Null
+    $rows = New-Object System.Collections.Generic.List[string]
+    if ((Test-Path -LiteralPath $LogPath) -and (Test-Path -LiteralPath $SharedDir)) {
+        $seen = @{}
+        foreach ($line in @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue)) {
+            if (-not $line) { continue }
+            if ($line -notmatch 'generated from transcript: (local_[0-9a-fA-F-]{36}\.json)') { continue }
+            $fname = $Matches[1]
+            if ($seen.ContainsKey($fname)) { continue }
+            $seen[$fname] = $true
+            $path = Join-Path $SharedDir $fname
+            if (-not (Test-Path -LiteralPath $path)) { continue }
+            $id = $fname.Substring(6, $fname.Length - 11).ToLowerInvariant()
+            $txt = ''
+            try { $txt = [System.IO.File]::ReadAllText($path) } catch { continue }
+            if ($txt -notmatch '"cliSessionId"\s*:\s*"([0-9a-fA-F-]{36})"') { continue }
+            if ($Matches[1].ToLowerInvariant() -ne $id) { continue }
+            $rows.Add(("{0}`t{1}" -f $fname, $id))
+        }
+    }
+    $text = ''
+    if ($rows.Count -gt 0) { $text = (($rows -join "`n") + "`n") }
+    [System.IO.File]::WriteAllText($HealMadePath, $text)
+    if ($rows.Count -gt 0) {
+        Write-Log ('Heal record seeded from the log: {0} entry(ies) self-heal created before.' -f $rows.Count)
+    }
+}
+
+function Remove-DuplicateHealedEntries {
+    # Drop a self-heal entry once the app has written its OWN entry for the
+    # same conversation. Self-heal must name its file after the TRANSCRIPT
+    # id, because that is the only id it knows; the app names its entry after
+    # its OWN session id and keeps the transcript id inside as cliSessionId.
+    # So when the app later persists its own entry for a conversation we
+    # already healed (reproducible by closing and reopening an account), the
+    # list holds two entries for one chat: it shows up twice, and an archived
+    # one looks un-archived, because our copy carries isArchived false while
+    # the app's carries the real flag.
+    # Only files recorded in heal-made.tsv are ever removed, and only while a
+    # NON-ours entry for the same cliSessionId exists, so the app's copy is
+    # always the survivor and nothing we did not write is ever touched. The
+    # deletion goes into the run manifest, so -Revert puts it back.
+    Set-StrictMode -Version 2
+    if (-not (Test-Path -LiteralPath $SharedDir)) { return }
+    $made = Get-HealMade
+    if ($made.Count -eq 0) { return }
+
+    # Group the list by cliSessionId, ours against the app's. Regex, never
+    # ConvertFrom-Json: a few real entries carry case-colliding
+    # enabledMcpTools keys that ConvertFrom-Json rejects.
+    $mine   = @{}
+    $theirs = @{}
+    foreach ($f in @(Get-ChildItem -LiteralPath $SharedDir -File -Force -ErrorAction SilentlyContinue)) {
+        if ($f.Name -notmatch $script:LocalNameRe) { continue }
+        $txt = ''
+        try { $txt = [System.IO.File]::ReadAllText($f.FullName) } catch { continue }
+        if ($txt -notmatch '"cliSessionId"\s*:\s*"([0-9a-fA-F-]{36})"') { continue }
+        $id = $Matches[1].ToLowerInvariant()
+        if ($made.ContainsKey($f.Name)) {
+            if (-not $mine.ContainsKey($id)) { $mine[$id] = New-Object System.Collections.Generic.List[string] }
+            $mine[$id].Add($f.Name)
+        } elseif ($theirs.ContainsKey($id)) {
+            $theirs[$id]++
+        } else {
+            $theirs[$id] = 1
+        }
+    }
+    $drop = New-Object System.Collections.Generic.List[string]
+    foreach ($id in @($mine.Keys)) {
+        if (-not $theirs.ContainsKey($id)) { continue }
+        foreach ($name in $mine[$id]) { $drop.Add($name) }
+    }
+    if ($drop.Count -eq 0) { return }
+
+    if ($DryRun) {
+        foreach ($name in $drop) {
+            Write-Host ('  would drop duplicate list entry {0} (the app now has its own)' -f $name)
+        }
+        Write-Host ('Duplicate cleanup: {0} entry(ies) the app has since re-created itself.' -f $drop.Count)
+        return
+    }
+
+    $dropped = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $drop) {
+        $src = Join-Path $SharedDir $name
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        Initialize-RunDir
+        $entryBackupDir = Join-Path $script:RunDir 'entries'
+        New-Item -ItemType Directory -Force -Path $entryBackupDir | Out-Null
+        $bak = Join-Path $entryBackupDir $name
+        try {
+            Copy-Item -LiteralPath $src -Destination $bak -Force
+            Remove-Item -LiteralPath $src -Force
+        } catch { continue }
+        Add-ManifestRow ("deleted`t{0}`t{1}" -f $src, $bak)
+        $dropped.Add($name)
+    }
+    if ($dropped.Count -eq 0) { return }
+
+    # Forget the rows we just dropped: the app owns those conversations now,
+    # and the heal ledger already holds their ids, so self-heal will not
+    # remake them.
+    $gone = @{}
+    foreach ($name in $dropped) { $gone[$name] = $true }
+    $keep = New-Object System.Collections.Generic.List[string]
+    foreach ($line in @(Get-Content -LiteralPath $HealMadePath -ErrorAction SilentlyContinue)) {
+        if (-not $line) { continue }
+        if ($gone.ContainsKey((($line -split "`t")[0]))) { continue }
+        $keep.Add($line)
+    }
+    $text = ''
+    if ($keep.Count -gt 0) { $text = (($keep -join "`n") + "`n") }
+    $tmp = "$HealMadePath.tmp.$PID"
+    [System.IO.File]::WriteAllText($tmp, $text)
+    Move-Item -LiteralPath $tmp -Destination $HealMadePath -Force
+    Write-Log ('Duplicate cleanup: dropped {0} self-heal entry(ies) the app has since re-created itself.' -f $dropped.Count)
+}
+
 function Invoke-SessionHeal {
     # For every transcript with no list entry in _shared and no heal-ledger
     # record, generate a minimal entry the app can render and resume.
@@ -1310,6 +1597,10 @@ function Invoke-SessionHeal {
             (Get-Item -LiteralPath $dst).LastWriteTimeUtc = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$m.LastMs).UtcDateTime
         } catch { }
         Add-ManifestRow ("created`t{0}" -f $dst)
+        # Record it as ours, so that if the app later writes its own entry
+        # for the same conversation the dedupe pass knows which of the two
+        # copies it is allowed to remove.
+        Add-HealMadeRow -FileName ('local_{0}.json' -f $p.Id) -CliSessionId $p.Id
         $listed[$p.Id.ToLowerInvariant()] = $true
         $made++
         Write-Log ('  generated from transcript: local_{0}.json  [{1}]' -f $p.Id, $m.Title)
@@ -1555,6 +1846,9 @@ function Invoke-SessionModule {
                     if ($f.Name -match $script:LocalNameRe) { $wouldList[$Matches[1].ToLowerInvariant()] = $true }
                 }
             }
+            # Preview the duplicate cleanup too (it is a no-op until _shared
+            # exists), so the dry run shows the whole first real run.
+            Remove-DuplicateHealedEntries
             Invoke-SessionHeal -ListedOverride $wouldList
             return 0
         } elseif (Test-ClaudeDesktopRunning) {
@@ -1565,6 +1859,12 @@ function Invoke-SessionModule {
         }
     }
     if ($state.SharedExists) {
+        # Dedupe first, so the "already listed" scan inside the heal sees the
+        # cleaned-up list. Both passes are id-based, so the order cannot
+        # loop: a conversation whose app entry survives is listed, so it is
+        # never re-healed.
+        Initialize-HealMade
+        Remove-DuplicateHealedEntries
         Invoke-SessionHeal
         Invoke-ArchiveReplay
         $n = @(Get-ChildItem -LiteralPath $SharedDir -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
@@ -1591,17 +1891,31 @@ function Invoke-Sync {
     if ($rc -ne 0) { return $rc }
 
     # Prune old backup runs (keep the newest N, reverted ones included).
-    # Run dirs contain only real copies (junctions are recorded as tsv
-    # rows, never materialized), so a recursive delete here is safe.
+    # Runs that wrote a claude_desktop_config.json (they have a configs\
+    # subdir) are counted SEPARATELY from session-only runs: they are the
+    # only ones worth reverting for an MCP or settings mistake and they are
+    # rare next to session runs. The watcher fires on every transcript write,
+    # so ten session runs can happen in an hour; with one shared window the
+    # one backup that could undo a server wipe is pruned within hours, before
+    # anyone notices (macOS, 2026-07-27). Two independent windows fix that.
+    # Run dirs contain only real copies (junctions are recorded as tsv rows,
+    # never materialized), so a recursive delete here is safe.
     if (Test-Path $BackupsDir) {
         $runs = @(Get-ChildItem -Path $BackupsDir -Directory |
                   Where-Object { $_.Name -match '^\d+(\.reverted)?$' } |
                   Sort-Object { [long](($_.Name -replace '\.reverted$', '')) } -Descending)
-        if ($runs.Count -gt $KeepBackups) {
-            foreach ($old in $runs[$KeepBackups..($runs.Count - 1)]) {
-                Remove-Item -LiteralPath $old.FullName -Recurse -Force
+        $pruneGroup = {
+            param($Group)
+            if ($Group.Count -gt $KeepBackups) {
+                foreach ($old in $Group[$KeepBackups..($Group.Count - 1)]) {
+                    Remove-Item -LiteralPath $old.FullName -Recurse -Force
+                }
             }
         }
+        $configRuns  = @($runs | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'configs') })
+        $sessionRuns = @($runs | Where-Object { -not (Test-Path -LiteralPath (Join-Path $_.FullName 'configs')) })
+        & $pruneGroup $configRuns
+        & $pruneGroup $sessionRuns
     }
 
     if ($script:RunDir) {
@@ -1877,7 +2191,7 @@ function Uninstall-ClaudeSync {
     Set-Content -Path $profilePath -Value $out
     Write-Host 'Removed. Open a new terminal for it to take effect.'
     Write-Host 'To delete the script, log, ledgers and backups too:'
-    Write-Host "  Remove-Item `"$CanonicalPath`", `"$LogPath`", `"$LedgerPath`", `"$LedgerAccountsPath`", `"$McpLedgerPath`", `"$HealLedgerPath`"; Remove-Item -Recurse `"$BackupsDir`""
+    Write-Host "  Remove-Item `"$CanonicalPath`", `"$LogPath`", `"$LedgerPath`", `"$LedgerAccountsPath`", `"$McpLedgerPath`", `"$HealLedgerPath`", `"$HealMadePath`", `"$ArchiveIntentsPath`", `"$ArchiveOffsetsPath`"; Remove-Item -Recurse `"$BackupsDir`""
 }
 
 # ---------- status / help ---------------------------------------------------
@@ -1889,14 +2203,22 @@ function Show-Status {
         foreach ($root in $roots) {
             $cfg = Join-Path $root 'claude_desktop_config.json'
             $n = 0
+            $s = 0
             if (Test-Path -LiteralPath $cfg) {
                 try {
                     $json = ConvertFrom-Json ([System.IO.File]::ReadAllText($cfg))
                     $mProp = $json.PSObject.Properties['mcpServers']
                     if ($mProp -and $null -ne $mProp.Value) { $n = @($mProp.Value.PSObject.Properties).Count }
-                } catch { $n = '?' }
+                    $pProp = $json.PSObject.Properties['preferences']
+                    if ($pProp -and $null -ne $pProp.Value) { $s = @($pProp.Value.PSObject.Properties).Count }
+                } catch { $n = '?'; $s = '?' }
             }
-            Write-Host ('  {0}: {1} MCP server(s)' -f (Split-Path -Leaf $root), $n)
+            Write-Host ('  {0}: {1} MCP server(s), {2} setting(s)' -f (Split-Path -Leaf $root), $n, $s)
+        }
+        $ledgerRows = 0
+        foreach ($cfgSet in (Read-McpLedger).Values) { $ledgerRows += $cfgSet.Count }
+        if ($ledgerRows -gt 0) {
+            Write-Host ('  MCP ledger: {0} (config, server) row(s)' -f $ledgerRows)
         }
     }
     Write-Host "Sessions dir: $SessionsDir"
@@ -1921,7 +2243,11 @@ function Show-Status {
         Write-Host "  junction to an unexpected target (left alone): $odd"
     }
     $healN = (Get-HealLedger).Count
-    if ($healN -gt 0) { Write-Host ('  heal ledger: {0} session id(s) tracked' -f $healN) }
+    if ($healN -gt 0) { Write-Host ('  heal ledger: {0} session id(s) tracked (deleted entries stay deleted)' -f $healN) }
+    if (Test-Path -LiteralPath $HealMadePath) {
+        $madeN = (Get-HealMade).Count
+        Write-Host ('  heal record: {0} entry(ies) written by self-heal (dropped if the app writes its own)' -f $madeN)
+    }
     if (Test-Path -LiteralPath $ProjectsDir) {
         $tn = 0
         foreach ($pd in @(Get-ChildItem -Path $ProjectsDir -Directory -ErrorAction SilentlyContinue)) {
@@ -1982,8 +2308,19 @@ self-heals: a session whose transcript exists but whose list entry was
 never written (app restart, rewound session) gets a minimal entry
 generated from the transcript. Existing entries are never edited;
 transcripts are never touched; deletes are never resurrected (tracked
-in heal-ledger.tsv). The restructure backs up the whole tree first and
--Revert restores it completely (also only with Claude closed).
+in heal-ledger.tsv). The only entry ever deleted is a self-heal copy the
+app has since replaced with its own (heal-made.tsv records what we
+wrote), which is what used to show one chat twice. The restructure backs
+up the whole tree first and -Revert restores it completely (also only
+with Claude closed).
+
+Customization syncs across claude-deck profiles too: MCP servers, app
+settings (the preferences block) and Desktop Extensions. The newest
+change wins a conflict, settings are add-only, and an MCP removal
+propagates only when mcp-ledger.tsv can name the config that lost it.
+A config that lost two or more servers at once is read as a stale
+Claude Desktop writeback instead: it decides nothing that run and is
+refilled from the others (CLAUDE_SYNC_MCP_RESET_MIN raises the two).
 
 Usage: claude-sync [command]   (--gnu-style spellings work too)
 
@@ -1998,7 +2335,8 @@ Usage: claude-sync [command]   (--gnu-style spellings work too)
   -Revert          Undo the most recent run from its backup. A run that
                    restructured the tree restores it fully (Claude must
                    be closed for that).
-  -Status          Show tree state, entry counts, install state.
+  -Status          Show tree state, entry counts, per-profile MCP and
+                   settings counts, ledger sizes, install state.
   -Install         Copy this script to ~\.claude\scripts\ and register the
                    'claude-sync' command in your PowerShell profile.
                    Re-run to update.
